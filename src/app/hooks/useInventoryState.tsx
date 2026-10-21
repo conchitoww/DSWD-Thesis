@@ -1,22 +1,58 @@
-import { useEffect, useMemo, useState } from 'react';
-import { backendApi } from '../services/backendApi';
-import { blockchain } from '../services/blockchain';
+import { useEffect, useMemo, useState, useCallback } from 'react';
+import {
+  backendApi,
+  type LguRecord,
+  type LguInput,
+  type ProvinceRecord,
+  type WarehouseRecord,
+  type SupplySourceRecord,
+  type KitTypeRecord,
+  type TruckRecord,
+  type IncidentRecord,
+  type InventoryBatchRecord,
+  type WarehouseStockRecord,
+  type LguStockRecord,
+  type CustodyHopRecord,
+  DEFAULT_TRUCKS,
+  DEFAULT_INCIDENTS
+} from '../services/backendApi';
+import { blockchain, generateBatchTokenId } from '../services/blockchain';
+import { computeSynchronizedLgus, type SynchronizedLgu, normalizeCategoryName } from '../lib/lguSync';
+import {
+  findMatchingLgu,
+  normalizeLguName,
+  DEFAULT_PANAY_LGUS,
+  DEFAULT_KIT_TYPES,
+  DEFAULT_PROVINCES,
+  DEFAULT_WAREHOUSES,
+  DEFAULT_SUPPLY_SOURCES
+} from '../lib/lguMatching';
+import { parseIncidentInfo } from '../lib/incidentHelper';
+import { formatOutgoingReference } from '../lib/referenceCodeHelper';
+import { evaluatePriorityIndicator, type PriorityColor, type PriorityLevel } from '../lib/priorityLogic';
+import type { LguReplenishPayload } from '../components/modals/ReplenishLguModal';
+import { getLguCategoryStock } from '../components/modals/ReplenishLguModal';
 
 export interface InventoryItem {
   category: string;
   warehouseA: number;
   warehouseB: number;
+  totalStock?: number;
+  warehouseBreakdown?: Record<string, number>;
 }
 
-export type WarehouseName = 'Oton Main Warehouse' | 'Pototan Main Warehouse';
-export type IncomingStatus = 'Draft' | 'Pending Verification' | 'Verified' | 'Minted' | 'Correction Requested' | 'Rejected';
+export type UserRole = 'Admin' | 'Receiver' | 'LGUReceiver' | 'Unregistered';
+
+export type WarehouseName = string;
+export type IncomingStatus = 'Draft' | 'Pending Verification' | 'Verified' | 'Correction Requested' | 'Rejected' | 'Cancelled';
 export type OutgoingStatus = 'Draft' | 'Allocating' | 'Approved' | 'Packed' | 'Released' | 'In Transit' | 'Delivered' | 'Accepted' | 'Distributed' | 'Correction Requested' | 'Cancelled';
-export type PriorityColor = 'Red' | 'Yellow' | 'Green';
+export type { PriorityColor, PriorityLevel };
 
 export interface AuditEvent {
   id: string;
   timestamp: string;
   actor: string;
+  role?: string;
   action: string;
   details: string;
   txHash?: string;
@@ -24,6 +60,7 @@ export interface AuditEvent {
 
 export interface IncomingGoods {
   id: string;
+  manifestNumber?: string;
   dateReceived: string;
   fnfiCategory: string;
   quantity: number;
@@ -32,7 +69,7 @@ export interface IncomingGoods {
   source: string;
   destinationType: 'Warehouse' | 'LGU';
   destination: string;
-  incidentCode: string;
+  incidentCode?: string;
   status: IncomingStatus;
   manifestHash: string;
   batchTokenId?: string;
@@ -41,34 +78,67 @@ export interface IncomingGoods {
   verifiedBy?: string;
   mintedAt?: string;
   auditTrail: AuditEvent[];
+  // v3 normalized relational keys
+  supplySourceId?: string;
+  kitTypeId?: string;
+  destinationWarehouseId?: string;
+  destinationLguId?: string;
+}
+
+export interface BatchAllocation {
+  batchTokenId: string;
+  batchNumber?: string;
+  expirationDate?: string;
+  quantity: number;
 }
 
 export interface OutgoingRelease {
+  id?: string;
   drNumber: string;
+  rawDrNumber?: string;
   dateAllocated: string;
+  dateRequested?: string;
+  lguId?: string;
+  destinationLguId?: string;
   lguName: string;
   province: string;
   municipality: string;
+  destination?: string;
   fnfiCategory: string;
   amountRequested: number;
   amountApproved: number;
+  sourceType?: 'Warehouse' | 'LGU';
   warehouseSource: string;
   deliveryMode: string;
   deliveryStatus: OutgoingStatus;
   incidentCode: string;
-  allocatedBatchTokenIds: string[];
+  incidentDate?: string;
+  reportReason?: string;
+  allocatedBatches: BatchAllocation[];
   handoverContractId?: string;
+  adminSignature?: string;
   senderSignature?: string;
   receiverSignature?: string;
   senderGps?: string;
   receiverGps?: string;
+  destinationAddress?: string;
   blockchainTxHash?: string;
   correctionNote?: string;
+  truckId?: string | null;
+  plateNumber?: string | null;
+  assignedTruckId?: string | null;
+  assigned_truck_id?: string | null;
+  assignedEscortProfileId?: string | null;
+  assignedDriverProfileId?: string | null;
+  sourceWarehouseId?: string | null;
+  sourceLguId?: string | null;
+  kitTypeId?: string | null;
   auditTrail: AuditEvent[];
 }
 
 export interface LGUPriorityReport {
   id: string;
+  lguId?: string;
   municipality: string;
   province: string;
   lguName: string;
@@ -80,15 +150,40 @@ export interface LGUPriorityReport {
   damageIndex: number;
   urgencyScore: number;
   priorityColor: PriorityColor;
+  priorityLevel?: PriorityLevel;
+  maxStock?: number;
+  stockRate?: number;
+  completionRate?: number;
+  effectiveRate?: number;
+  systemResponse?: string;
   recommendation: string;
 }
 
+export interface DiscrepancyReport {
+  id: string;
+  reportType: 'Incoming' | 'Outgoing';
+  manifestNumber?: string;
+  drNumber?: string;
+  note: string;
+  reportedByRole?: string;
+  reportedByWallet?: string;
+  reportedAt: string;
+}
+
+export type LGUInventoryReportInput = Omit<LGUPriorityReport, 'id' | 'reportedAt' | 'urgencyScore' | 'priorityColor' | 'recommendation'>;
+
 const nowStamp = () => new Date().toLocaleString('en-PH', { hour12: false });
 
-const makeAudit = (action: string, details: string, txHash?: string): AuditEvent => ({
-  id: `AUD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+const makeAudit = (
+  action: string,
+  details: string,
+  txHash?: string,
+  actor?: { name?: string; role?: string }
+): AuditEvent => ({
+  id: `AUD-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
   timestamp: nowStamp(),
-  actor: 'DSWD FO VI Logistics Officer',
+  actor: actor?.name || 'System / Unattributed',
+  role: actor?.role,
   action,
   details,
   txHash
@@ -103,13 +198,22 @@ const makeManifestHash = (item: Pick<IncomingGoods, 'dateReceived' | 'fnfiCatego
   return `MANIFEST-${Math.abs(hash).toString(16).toUpperCase().padStart(8, '0')}`;
 };
 
-const makeTxHash = (prefix: string) => `0x${prefix}${Math.random().toString(16).slice(2, 10)}${Date.now().toString(16)}`;
+const normalizeWarehouseName = (value: string): WarehouseName | null => {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'oton main warehouse' || normalized === 'oton warehouse' || normalized === 'oton') {
+    return 'Oton Main Warehouse';
+  }
+  if (normalized === 'pototan main warehouse' || normalized === 'pototan warehouse' || normalized === 'pototan') {
+    return 'Pototan Main Warehouse';
+  }
+  return null;
+};
 
 const isMainWarehouse = (warehouse: string): warehouse is WarehouseName =>
-  warehouse === 'Oton Main Warehouse' || warehouse === 'Pototan Main Warehouse';
+  normalizeWarehouseName(warehouse) !== null;
 
 const isIncomingStatus = (status: unknown): status is IncomingStatus =>
-  typeof status === 'string' && ['Draft', 'Pending Verification', 'Verified', 'Minted', 'Correction Requested', 'Rejected'].includes(status);
+  typeof status === 'string' && ['Draft', 'Pending Verification', 'Verified', 'Correction Requested', 'Rejected', 'Cancelled'].includes(status);
 
 const isOutgoingStatus = (status: unknown): status is OutgoingStatus =>
   typeof status === 'string' && ['Draft', 'Allocating', 'Approved', 'Packed', 'Released', 'In Transit', 'Delivered', 'Accepted', 'Distributed', 'Correction Requested', 'Cancelled'].includes(status);
@@ -132,6 +236,41 @@ type IncomingManifestRow = {
   batch_token_id?: string | null;
   minted_at?: string | null;
   wallet_address?: string | null;
+  correction_note?: string | null;
+  verified_by?: string | null;
+  created_at?: string | null;
+  supply_source_id?: string | null;
+  kit_type_id?: string | null;
+  destination_warehouse_id?: string | null;
+  destination_lgu_id?: string | null;
+};
+
+type LGUInventoryReportRow = {
+  id: string;
+  municipality?: string | null;
+  province?: string | null;
+  lgu_name?: string | null;
+  reported_at?: string | null;
+  food_packs?: number | null;
+  hygiene_kits?: number | null;
+  family_kits?: number | null;
+  affected_families?: number | null;
+  damage_index?: number | null;
+  urgency_score?: number | null;
+  priority_color?: string | null;
+  recommendation?: string | null;
+  created_at?: string | null;
+};
+
+type DiscrepancyReportRow = {
+  id: string;
+  report_type?: string | null;
+  manifest_number?: string | null;
+  dr_number?: string | null;
+  note?: string | null;
+  reported_by_role?: string | null;
+  reported_by_wallet?: string | null;
+  reported_at?: string | null;
   created_at?: string | null;
 };
 
@@ -139,6 +278,8 @@ type OutgoingRequestRow = {
   id: string;
   dr_number?: string | null;
   date_allocated?: string | null;
+  lgu_id?: string | null;
+  destination_lgu_id?: string | null;
   lgu_name?: string | null;
   province?: string | null;
   municipality?: string | null;
@@ -149,19 +290,29 @@ type OutgoingRequestRow = {
   delivery_mode?: string | null;
   delivery_status?: string | null;
   incident_code?: string | null;
+  allocated_batches?: { batchTokenId?: string | null; quantity?: number | null }[] | null;
   sender_gps?: string | null;
   receiver_gps?: string | null;
+  destination_address?: string | null;
+  assigned_truck_id?: string | null;
+  assigned_driver_profile_id?: string | null;
+  source_warehouse_id?: string | null;
+  source_lgu_id?: string | null;
+  kit_type_id?: string | null;
+  source_type?: 'Warehouse' | 'LGU' | null;
   tx_hash?: string | null;
   handover_contract_id?: string | null;
+  admin_signature?: string | null;
   sender_signature?: string | null;
   receiver_signature?: string | null;
   wallet_address?: string | null;
   created_at?: string | null;
 };
 
-const mapIncomingManifest = (row: IncomingManifestRow): IncomingGoods => {
+export const mapIncomingManifest = (row: IncomingManifestRow): IncomingGoods => {
   const item = {
-    id: row.manifest_number ?? row.id,
+    id: row.id || row.manifest_number || `INC-${Date.now()}`,
+    manifestNumber: row.manifest_number ?? row.id,
     dateReceived: row.date_received ?? '',
     fnfiCategory: row.category ?? '',
     quantity: row.quantity ?? 0,
@@ -173,39 +324,226 @@ const mapIncomingManifest = (row: IncomingManifestRow): IncomingGoods => {
     incidentCode: row.incident_code ?? '',
     status: isIncomingStatus(row.status) ? row.status : 'Draft',
     manifestHash: row.manifest_hash ?? '',
-  batchTokenId: row.batch_token_id ?? undefined,
-  blockchainTxHash: row.tx_hash ?? undefined,
-    mintedAt: row.minted_at ?? undefined
+    batchTokenId: row.batch_token_id ?? undefined,
+    blockchainTxHash: row.tx_hash ?? undefined,
+    mintedAt: row.minted_at ?? undefined,
+    correctionNote: row.correction_note ?? undefined,
+    verifiedBy: row.verified_by ?? undefined,
+    supplySourceId: row.supply_source_id ?? undefined,
+    kitTypeId: row.kit_type_id ?? undefined,
+    destinationWarehouseId: row.destination_warehouse_id ?? undefined,
+    destinationLguId: row.destination_lgu_id ?? undefined
   } satisfies Omit<IncomingGoods, 'auditTrail'>;
 
   return {
     ...item,
     manifestHash: item.manifestHash || makeManifestHash(item),
-    auditTrail: [makeAudit('Loaded from Supabase', `Incoming manifest restored from database as ${item.status}.`, item.blockchainTxHash)]
+    auditTrail: []
   };
 };
 
-const mapOutgoingRequest = (row: OutgoingRequestRow): OutgoingRelease => ({
-  drNumber: row.dr_number ?? row.id,
-  dateAllocated: row.date_allocated ?? '',
-  lguName: row.lgu_name ?? '',
-  province: row.province ?? '',
-  municipality: row.municipality ?? '',
-  fnfiCategory: row.category ?? '',
-  amountRequested: row.amount_requested ?? 0,
-  amountApproved: row.amount_approved ?? 0,
-  warehouseSource: row.warehouse_source ?? '',
-  deliveryMode: row.delivery_mode ?? '',
-  deliveryStatus: isOutgoingStatus(row.delivery_status) ? row.delivery_status : 'Allocating',
-  incidentCode: row.incident_code ?? '',
-  allocatedBatchTokenIds: [],
-  handoverContractId: row.handover_contract_id ?? undefined,
-  senderSignature: row.sender_signature ?? undefined,
-  receiverSignature: row.receiver_signature ?? undefined,
-  senderGps: row.sender_gps ?? undefined,
-  receiverGps: row.receiver_gps ?? undefined,
-  blockchainTxHash: row.tx_hash ?? undefined,
-  auditTrail: [makeAudit('Loaded from Supabase', `Outgoing request restored from database as ${row.delivery_status ?? 'Allocating'}.`, row.tx_hash ?? undefined)]
+
+const computePriority = (report: Pick<LGUPriorityReport, 'foodPacks' | 'affectedFamilies' | 'damageIndex'>) => {
+  const evalRes = evaluatePriorityIndicator({
+    foodPacks: report.foodPacks,
+    affectedFamilies: report.affectedFamilies
+  });
+
+  return {
+    urgencyScore: evalRes.urgencyScore,
+    priorityColor: evalRes.priorityColor,
+    priorityLevel: evalRes.priorityLevel,
+    stockRate: evalRes.stockRate,
+    completionRate: evalRes.completionRate,
+    effectiveRate: evalRes.effectiveRate,
+    systemResponse: evalRes.systemResponse,
+    recommendation: evalRes.systemResponse
+  };
+};
+
+const mapLGUInventoryReport = (row: LGUInventoryReportRow): LGUPriorityReport => {
+  const base = {
+    id: row.id,
+    municipality: row.municipality ?? '',
+    province: row.province ?? '',
+    lguName: row.lgu_name ?? '',
+    reportedAt: row.reported_at ?? row.created_at ?? nowStamp(),
+    foodPacks: row.food_packs ?? 0,
+    hygieneKits: row.hygiene_kits ?? 0,
+    familyKits: row.family_kits ?? 0,
+    affectedFamilies: row.affected_families ?? 0,
+    damageIndex: row.damage_index ?? 0
+  };
+  const computed = computePriority(base);
+  const priorityColor = (row.priority_color === 'Red' || row.priority_color === 'Orange' || row.priority_color === 'Yellow' || row.priority_color === 'Green')
+    ? row.priority_color
+    : computed.priorityColor;
+
+  return {
+    ...base,
+    urgencyScore: row.urgency_score ?? computed.urgencyScore,
+    priorityColor,
+    priorityLevel: computed.priorityLevel,
+    stockRate: computed.stockRate,
+    completionRate: computed.completionRate,
+    effectiveRate: computed.effectiveRate,
+    systemResponse: computed.systemResponse,
+    recommendation: row.recommendation ?? computed.recommendation
+  };
+};
+
+export const deduplicateLguPriorityReports = (reports: LGUPriorityReport[], lgus?: LguRecord[]): LGUPriorityReport[] => {
+  const map = new Map<string, LGUPriorityReport>();
+
+  for (const report of reports) {
+    const rawMuni = report.municipality || report.lguName || '';
+    const matched = lgus && lgus.length > 0 ? findMatchingLgu(lgus, rawMuni, report.province) : undefined;
+    const canonical = matched?.municipality ?? (normalizeLguName(rawMuni) ? rawMuni.trim() : rawMuni.trim());
+    if (!canonical) continue;
+
+    const key = canonical.toLowerCase();
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, { ...report, municipality: canonical });
+    } else {
+      const existingTime = new Date(existing.reportedAt || 0).getTime();
+      const currentTime = new Date(report.reportedAt || 0).getTime();
+      if (currentTime > existingTime) {
+        map.set(key, { ...report, municipality: canonical });
+      }
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => b.urgencyScore - a.urgencyScore);
+};
+
+export const mapOutgoingRequest = (row: OutgoingRequestRow): OutgoingRelease => {
+  const rawBatches = Array.isArray(row.allocated_batches)
+    ? row.allocated_batches
+    : typeof row.allocated_batches === 'string'
+    ? (() => {
+        try {
+          const parsed = JSON.parse(row.allocated_batches);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      })()
+    : [];
+
+  const allocatedBatches: BatchAllocation[] = rawBatches.flatMap((entry: any) => {
+    const tokenId = entry?.batchTokenId || entry?.batch_token_id;
+    const qty = Number(entry?.quantity ?? 0);
+    if (!tokenId || qty <= 0) return [];
+    return [{ batchTokenId: String(tokenId), quantity: qty }];
+  });
+
+  return {
+    id: row.id,
+    drNumber: row.dr_number ? formatOutgoingReference({ incidentCode: row.incident_code, drNumber: row.dr_number }) : (row.id || 'INC-N/A'),
+    rawDrNumber: row.dr_number ?? undefined,
+    dateAllocated: row.date_allocated ?? '',
+    dateRequested: row.date_allocated ?? '',
+    lguId: row.lgu_id ?? undefined,
+    destinationLguId: row.destination_lgu_id ?? row.lgu_id ?? undefined,
+    lguName: row.lgu_name ?? '',
+    province: row.province ?? '',
+    municipality: row.municipality ?? '',
+    destination: row.municipality ?? row.lgu_name ?? '',
+    fnfiCategory: row.category ?? '',
+    amountRequested: Number(row.amount_requested ?? 0),
+    amountApproved: Number(row.amount_approved ?? 0),
+    warehouseSource: row.warehouse_source ?? '',
+    sourceType: row.source_type === 'LGU' ? 'LGU' : 'Warehouse',
+    deliveryMode: row.delivery_mode ?? '',
+    deliveryStatus: isOutgoingStatus(row.delivery_status) ? row.delivery_status : 'Allocating',
+    incidentCode: row.incident_code ?? '',
+    incidentDate: parseIncidentInfo(row.incident_code).incidentDate || row.date_allocated || undefined,
+    reportReason: parseIncidentInfo(row.incident_code).reportReason || undefined,
+    allocatedBatches,
+    handoverContractId: row.handover_contract_id ?? undefined,
+    adminSignature: row.tx_hash ?? row.admin_signature ?? undefined,
+    senderSignature: row.sender_signature ?? undefined,
+    receiverSignature: row.receiver_signature ?? undefined,
+    senderGps: row.sender_gps ?? undefined,
+    receiverGps: row.receiver_gps ?? undefined,
+    destinationAddress: row.destination_address ?? undefined,
+    assignedTruckId: row.assigned_truck_id ?? undefined,
+    assigned_truck_id: row.assigned_truck_id ?? undefined,
+    assignedEscortProfileId: row.assigned_driver_profile_id ?? undefined,
+    assignedDriverProfileId: row.assigned_driver_profile_id ?? undefined,
+    sourceWarehouseId: row.source_warehouse_id ?? undefined,
+    sourceLguId: row.source_lgu_id ?? undefined,
+    kitTypeId: row.kit_type_id ?? undefined,
+    blockchainTxHash: row.tx_hash ?? undefined,
+    auditTrail: (() => {
+      const trail: AuditEvent[] = [];
+      const dr = row.dr_number ?? row.id ?? 'DR';
+      const createdTime = row.created_at || row.date_allocated || nowStamp();
+
+      // 1. Release Draft Created
+      trail.push({
+        id: `AUD-CREATED-${dr}`,
+        timestamp: createdTime,
+        actor: 'DSWD Admin',
+        role: 'Admin',
+        action: 'Release Draft Created',
+        details: `Allocation request drafted for ${Number(row.amount_approved ?? row.amount_requested ?? 0)} ${row.category || 'units'} to ${row.destination_address || row.lgu_name || 'LGU'}.`
+      });
+
+      // 2. Release Minted & Authorized
+      if (row.tx_hash || row.admin_signature) {
+        trail.push({
+          id: `AUD-AUTH-${dr}`,
+          timestamp: row.date_allocated || createdTime,
+          actor: 'DSWD Admin',
+          role: 'Admin',
+          action: 'Release Minted & Authorized',
+          details: 'Release authorized on-chain. Batches allocated and immutable dispatch order generated.',
+          txHash: row.tx_hash || row.admin_signature || undefined
+        });
+      }
+
+      // 3. Custody Accepted & In Transit
+      if (row.sender_signature || ['In Transit', 'Delivered', 'Accepted', 'Distributed'].includes(row.delivery_status || '')) {
+        trail.push({
+          id: `AUD-CUSTODY-${dr}`,
+          timestamp: row.date_allocated || createdTime,
+          actor: row.assigned_truck_id ? `Escort Officer (${row.assigned_truck_id})` : 'Relief Escort Officer',
+          role: 'Receiver',
+          action: 'Escort Custody Accepted & In Transit',
+          details: `Relief Escort Officer assumed physical convoy custody for transit${row.sender_gps ? ` at GPS ${row.sender_gps}` : ''}. Tokens transferred to escort custody.`,
+          txHash: row.sender_signature || undefined
+        });
+      }
+
+      // 4. Receiver Accepted / LGU Received
+      if (row.receiver_signature || ['Accepted', 'Distributed'].includes(row.delivery_status || '')) {
+        trail.push({
+          id: `AUD-LGU-${dr}`,
+          timestamp: createdTime,
+          actor: row.lgu_name ? `LGU (${row.lgu_name})` : 'LGU Receiver',
+          role: 'LGUReceiver',
+          action: 'Receiver Accepted',
+          details: `LGU officer verified package delivery and accepted custody${row.receiver_gps ? ` at GPS ${row.receiver_gps}` : ''}. Tokens transferred to LGU custody.`,
+          txHash: row.receiver_signature || undefined
+        });
+      }
+
+      return trail.reverse();
+    })()
+  };
+};
+
+const mapDiscrepancyReport = (row: DiscrepancyReportRow): DiscrepancyReport => ({
+  id: row.id,
+  reportType: row.report_type === 'Outgoing' ? 'Outgoing' : 'Incoming',
+  manifestNumber: row.manifest_number ?? undefined,
+  drNumber: row.dr_number ?? undefined,
+  note: row.note ?? '',
+  reportedByRole: row.reported_by_role ?? undefined,
+  reportedByWallet: row.reported_by_wallet ?? undefined,
+  reportedAt: row.reported_at ?? row.created_at ?? nowStamp()
 });
 
 const emptyInventoryItem = (category: string): InventoryItem => ({
@@ -214,284 +552,1257 @@ const emptyInventoryItem = (category: string): InventoryItem => ({
   warehouseB: 0
 });
 
-const calculateAvailableInventory = (incoming: IncomingGoods[], outgoing: OutgoingRelease[]): InventoryItem[] => {
-  const stock = new Map<string, InventoryItem>();
+const calculateWarehouseInventory = (warehouses: WarehouseRecord[], kitTypes: KitTypeRecord[]): InventoryItem[] => {
+  const STANDARD_CATEGORIES = ['Family Food Pack', 'Hygiene Kit', 'Sleeping Kit', 'Kitchen Kit', 'Family Kit', 'Laminated Sacks', 'Ready-to-Eat Food (RTEF)'];
+  const canonicalCategories = new Set<string>(STANDARD_CATEGORIES);
 
-  const ensureItem = (category: string) => {
-    if (!stock.has(category)) {
-      stock.set(category, emptyInventoryItem(category));
-    }
-    return stock.get(category)!;
-  };
-
-  incoming.forEach(item => {
-    if (item.status !== 'Minted' || item.destinationType !== 'Warehouse' || !isMainWarehouse(item.destination)) return;
-
-    const stockItem = ensureItem(item.fnfiCategory);
-    if (item.destination === 'Oton Main Warehouse') {
-      stockItem.warehouseA += item.quantity;
-    } else {
-      stockItem.warehouseB += item.quantity;
+  // Add custom kit types from database
+  kitTypes.forEach(k => {
+    if (k.name && k.isActive !== false) {
+      const canonical = normalizeCategoryName(k.name);
+      if (!STANDARD_CATEGORIES.includes(canonical)) {
+        canonicalCategories.add(canonical || k.name.trim());
+      }
     }
   });
 
-  outgoing.forEach(release => {
-    const consumesStock = ['Approved', 'Packed', 'Released', 'In Transit', 'Delivered', 'Accepted', 'Distributed'].includes(release.deliveryStatus);
-    if (!consumesStock || !isMainWarehouse(release.warehouseSource)) return;
-
-    const stockItem = ensureItem(release.fnfiCategory);
-    const quantity = release.amountApproved || release.amountRequested;
-    if (release.warehouseSource === 'Oton Main Warehouse') {
-      stockItem.warehouseA = Math.max(0, stockItem.warehouseA - quantity);
-    } else {
-      stockItem.warehouseB = Math.max(0, stockItem.warehouseB - quantity);
+  // Add any custom items found in warehouse currentStock
+  warehouses.forEach(wh => {
+    if (wh.currentStock) {
+      Object.keys(wh.currentStock).forEach(cat => {
+        const canonical = normalizeCategoryName(cat);
+        if (!STANDARD_CATEGORIES.includes(canonical)) {
+          canonicalCategories.add(canonical || cat.trim());
+        }
+      });
     }
   });
 
-  return Array.from(stock.values()).sort((a, b) => a.category.localeCompare(b.category));
+  const categoryNames = Array.from(canonicalCategories);
+  const itemsMap = new Map<string, InventoryItem>();
+
+  categoryNames.forEach(category => {
+    let warehouseA = 0;
+    let warehouseB = 0;
+    const warehouseBreakdown: Record<string, number> = {};
+    let totalStock = 0;
+
+    warehouses.forEach((wh, idx) => {
+      let stock = 0;
+      const catLower = category.toLowerCase();
+      if (category === 'Family Food Pack' || category === 'Food Pack' || catLower.includes('food pack')) stock = Number(wh.foodPacks ?? 0);
+      else if (category === 'Hygiene Kit' || catLower.includes('hygiene')) stock = Number(wh.hygieneKits ?? 0);
+      else if (category === 'Sleeping Kit' || catLower.includes('sleeping')) stock = Number(wh.sleepingKits ?? 0);
+      else if (category === 'Kitchen Kit' || catLower.includes('kitchen')) stock = Number(wh.kitchenKits ?? 0);
+      else if (category === 'Family Kit' || catLower.includes('family kit')) stock = Number(wh.familyKits ?? 0);
+      else if (category === 'Laminated Sacks' || category === 'Laminated Sack' || catLower.includes('sack')) stock = Number(wh.laminatedSacks ?? 0);
+      else if (category === 'Ready-to-Eat Food (RTEF)' || category === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) stock = Number(wh.rtef ?? 0);
+      else if (wh.currentStock && wh.currentStock[category] !== undefined) stock = Number(wh.currentStock[category] ?? 0);
+      else stock = 0;
+
+      if (!Number.isFinite(stock)) stock = 0;
+
+      warehouseBreakdown[wh.name] = stock;
+      totalStock += stock;
+
+      if (idx === 0) warehouseA = stock;
+      if (idx === 1) warehouseB = stock;
+    });
+
+    itemsMap.set(category, {
+      category,
+      warehouseA: Number(warehouseA || 0),
+      warehouseB: Number(warehouseB || 0),
+      totalStock: Number(totalStock || 0),
+      warehouseBreakdown
+    });
+  });
+
+  return Array.from(itemsMap.values());
 };
 
 const logBackendError = (action: string) => (error: unknown) => {
   console.error(`${action} did not persist to Supabase`, error);
 };
 
-export function useInventoryState() {
+const toFriendlyTxError = (error: unknown, fallback: string) => {
+  if (error && typeof error === 'object') {
+    const code = (error as { code?: string | number }).code;
+    if (code === 4001 || code === 'ACTION_REJECTED') {
+      return 'Transaction cancelled.';
+    }
+
+    if (error instanceof Error && error.message) {
+      const message = error.message.split('\n')[0].trim();
+      return message || fallback;
+    }
+  }
+  return fallback;
+};
+
+export interface ActorProfile {
+  id?: string;
+  fullName?: string;
+  email?: string;
+  role?: string;
+  walletAddress?: string;
+}
+
+export function useInventoryState(enabled = true, actorProfile?: ActorProfile | null) {
   const [integrationMode, setIntegrationMode] = useState<'backend' | 'mock'>('mock');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
 
-  const [incomingGoodsList, setIncomingGoodsList] = useState<IncomingGoods[]>([]);
-
-  const [outgoingReleasesList, setOutgoingReleasesList] = useState<OutgoingRelease[]>([]);
-
-  const lguPriorityReports: LGUPriorityReport[] = useMemo(() => {
-    const reports = [
-      { id: 'LGU-001', lguName: 'Leon Municipal Office', municipality: 'Leon', province: 'Iloilo', foodPacks: 95, hygieneKits: 80, familyKits: 50, affectedFamilies: 920, damageIndex: 88 },
-      { id: 'LGU-002', lguName: 'Miag-ao Municipal Office', municipality: 'Miag-ao', province: 'Iloilo', foodPacks: 220, hygieneKits: 180, familyKits: 120, affectedFamilies: 610, damageIndex: 62 },
-      { id: 'LGU-003', lguName: 'Banate Municipal Office', municipality: 'Banate', province: 'Iloilo', foodPacks: 180, hygieneKits: 120, familyKits: 90, affectedFamilies: 750, damageIndex: 73 },
-      { id: 'LGU-004', lguName: 'Guinhol Municipal Office', municipality: 'Guinhol', province: 'Iloilo', foodPacks: 130, hygieneKits: 90, familyKits: 70, affectedFamilies: 840, damageIndex: 81 },
-      { id: 'LGU-005', lguName: 'Iloilo City Government', municipality: 'Iloilo City', province: 'Iloilo', foodPacks: 700, hygieneKits: 500, familyKits: 350, affectedFamilies: 480, damageIndex: 35 }
-    ];
-
-    return reports.map(report => {
-      const stockScore = report.foodPacks < 150 ? 45 : report.foodPacks < 300 ? 25 : 8;
-      const demandScore = Math.min(35, Math.round(report.affectedFamilies / 30));
-      const damageScore = Math.round(report.damageIndex * 0.2);
-      const urgencyScore = Math.min(100, stockScore + demandScore + damageScore);
-      const priorityColor: PriorityColor = urgencyScore >= 75 ? 'Red' : urgencyScore >= 50 ? 'Yellow' : 'Green';
-
+  const currentActor = useMemo(() => {
+    if (!actorProfile) {
       return {
-        ...report,
-        reportedAt: '2026-05-15 08:00',
-        urgencyScore,
-        priorityColor,
-        recommendation:
-          priorityColor === 'Red'
-            ? 'Immediate restocking and dispatch recommended.'
-            : priorityColor === 'Yellow'
-            ? 'Prepare allocation; monitor within 24 hours.'
-            : 'Sufficient stock; continue monitoring.'
+        id: undefined,
+        name: 'System / Unattributed',
+        email: 'system@dswd.gov.ph',
+        role: 'System',
+        wallet: undefined
       };
-    }).sort((a, b) => b.urgencyScore - a.urgencyScore);
+    }
+    return {
+      id: actorProfile.id,
+      name: actorProfile.fullName || actorProfile.email || 'Authenticated Personnel',
+      email: actorProfile.email || 'system@dswd.gov.ph',
+      role: actorProfile.role || 'Personnel',
+      wallet: actorProfile.walletAddress
+    };
+  }, [actorProfile]);
+
+  const audit = (action: string, details: string, txHash?: string) =>
+    makeAudit(action, details, txHash, currentActor);
+
+  const [incomingGoodsList, setIncomingGoodsList] = useState<IncomingGoods[]>([]);
+  const [outgoingReleasesList, setOutgoingReleasesList] = useState<OutgoingRelease[]>([]);
+  const [lguPriorityReports, setLguPriorityReports] = useState<LGUPriorityReport[]>([]);
+  const [discrepancyReports, setDiscrepancyReports] = useState<DiscrepancyReport[]>([]);
+
+  // Master relational data directly from Supabase (with safe operational defaults)
+  const [provincesList, setProvincesList] = useState<ProvinceRecord[]>(DEFAULT_PROVINCES);
+  const [warehousesList, setWarehousesList] = useState<WarehouseRecord[]>(DEFAULT_WAREHOUSES);
+  const [supplySourcesList, setSupplySourcesList] = useState<SupplySourceRecord[]>(DEFAULT_SUPPLY_SOURCES);
+  const [kitTypesList, setKitTypesList] = useState<KitTypeRecord[]>(DEFAULT_KIT_TYPES);
+  const [lgusList, setLgusList] = useState<LguRecord[]>(DEFAULT_PANAY_LGUS);
+  const [trucksList, setTrucksList] = useState<TruckRecord[]>(DEFAULT_TRUCKS);
+  const [incidentsList, setIncidentsList] = useState<IncidentRecord[]>(DEFAULT_INCIDENTS);
+  const [warehouseStockList, setWarehouseStockList] = useState<WarehouseStockRecord[]>([]);
+  const [lguStockList, setLguStockList] = useState<LguStockRecord[]>([]);
+  const [inventoryBatchesList, setInventoryBatchesList] = useState<InventoryBatchRecord[]>([]);
+
+  const [adminActionsEnabled, setAdminActionsEnabledState] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem('dswd_admin_actions_enabled') === 'true';
+  });
+
+  const setAdminActionsEnabled = useCallback((enabled: boolean) => {
+    setAdminActionsEnabledState(enabled);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('dswd_admin_actions_enabled', String(enabled));
+      window.dispatchEvent(new CustomEvent('dswd_admin_actions_changed', { detail: { enabled } }));
+    }
   }, []);
 
   useEffect(() => {
-    setInventory(calculateAvailableInventory(incomingGoodsList, outgoingReleasesList));
-  }, [incomingGoodsList, outgoingReleasesList]);
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'dswd_admin_actions_enabled') {
+        setAdminActionsEnabledState(e.newValue === 'true');
+      }
+    };
+    const handleCustomChange = (e: Event) => {
+      const customEvent = e as CustomEvent<{ enabled: boolean }>;
+      if (customEvent.detail && typeof customEvent.detail.enabled === 'boolean') {
+        setAdminActionsEnabledState(customEvent.detail.enabled);
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('dswd_admin_actions_changed', handleCustomChange);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('dswd_admin_actions_changed', handleCustomChange);
+    };
+  }, []);
+
+  // Inventory is derived from the authoritative warehouses table
+  useEffect(() => {
+    setInventory(calculateWarehouseInventory(warehousesList, kitTypesList));
+  }, [warehousesList, kitTypesList]);
+
+  const refreshProvinces = async () => {
+    try {
+      const list = await backendApi.getProvinces();
+      setProvincesList(list);
+    } catch (err) {
+      console.warn('Failed to refresh provinces:', err);
+    }
+  };
+
+  const refreshWarehouses = async () => {
+    try {
+      const list = await backendApi.getWarehouses();
+      setWarehousesList(list);
+    } catch (err) {
+      console.warn('Failed to refresh warehouses:', err);
+    }
+  };
+
+  const refreshSupplySources = async () => {
+    try {
+      const list = await backendApi.getSupplySources();
+      setSupplySourcesList(list);
+    } catch (err) {
+      console.warn('Failed to refresh supply sources:', err);
+    }
+  };
+
+  const refreshKitTypes = async () => {
+    try {
+      const list = await backendApi.getKitTypes();
+      setKitTypesList(list);
+    } catch (err) {
+      console.warn('Failed to refresh kit types:', err);
+    }
+  };
+
+  const refreshTrucks = async () => {
+    try {
+      const list = await backendApi.getTrucks();
+      setTrucksList(list);
+    } catch (err) {
+      console.warn('Failed to refresh trucks:', err);
+    }
+  };
+
+  const refreshIncidents = async () => {
+    try {
+      const list = await backendApi.getIncidents();
+      setIncidentsList(list);
+    } catch (err) {
+      console.warn('Failed to refresh incidents:', err);
+    }
+  };
+
+  const refreshInventoryBatches = async () => {
+    try {
+      const list = await backendApi.getInventoryBatches();
+      setInventoryBatchesList(list);
+    } catch (err) {
+      console.warn('Failed to refresh inventory batches:', err);
+    }
+  };
 
   const addStock = (category: string, warehouse: WarehouseName, quantity: number) => {
-    setInventory(prev => {
-      const existingItem = prev.find(item => item.category === category);
+    const canonical = normalizeCategoryName(category);
+    const isOton = warehouse.toLowerCase().includes('oton');
+    const isPototan = warehouse.toLowerCase().includes('pototan');
 
+    // 1. Update authoritative warehousesList state in memory
+    setWarehousesList(prev => prev.map(wh => {
+      const match = wh.name.toLowerCase().includes(isOton ? 'oton' : 'pototan');
+      if (!match) return wh;
+
+      const catLower = category.toLowerCase();
+      const updated = { ...wh };
+      if (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) updated.foodPacks = (updated.foodPacks || 0) + quantity;
+      else if (canonical === 'Hygiene Kit' || catLower.includes('hygiene')) updated.hygieneKits = (updated.hygieneKits || 0) + quantity;
+      else if (canonical === 'Sleeping Kit' || catLower.includes('sleeping')) updated.sleepingKits = (updated.sleepingKits || 0) + quantity;
+      else if (canonical === 'Kitchen Kit' || catLower.includes('kitchen')) updated.kitchenKits = (updated.kitchenKits || 0) + quantity;
+      else if (canonical === 'Family Kit' || catLower.includes('family kit')) updated.familyKits = (updated.familyKits || 0) + quantity;
+      else if (canonical === 'Laminated Sacks' || canonical === 'Laminated Sack' || catLower.includes('sack')) updated.laminatedSacks = (updated.laminatedSacks || 0) + quantity;
+      else if (canonical === 'Ready-to-Eat Food (RTEF)' || canonical === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) updated.rtef = (updated.rtef || 0) + quantity;
+
+      const currentMap = { ...(updated.currentStock || {}) };
+      const curVal = currentMap[canonical] !== undefined ? currentMap[canonical] : (currentMap[category] ?? 0);
+      const nextVal = curVal + quantity;
+      if (canonical) currentMap[canonical] = nextVal;
+      currentMap[category] = nextVal;
+      updated.currentStock = currentMap;
+      return updated;
+    }));
+
+    // 2. Update inventory state immediately
+    setInventory(prev => {
+      const existingItem = prev.find(item => normalizeCategoryName(item.category) === canonical || item.category.toLowerCase() === category.toLowerCase());
       if (existingItem) {
         return prev.map(item =>
-          item.category === category
+          (normalizeCategoryName(item.category) === canonical || item.category.toLowerCase() === category.toLowerCase())
             ? {
                 ...item,
-                warehouseA: warehouse === 'Oton Main Warehouse' ? item.warehouseA + quantity : item.warehouseA,
-                warehouseB: warehouse === 'Pototan Main Warehouse' ? item.warehouseB + quantity : item.warehouseB
+                warehouseA: isOton ? item.warehouseA + quantity : item.warehouseA,
+                warehouseB: isPototan ? item.warehouseB + quantity : item.warehouseB,
+                totalStock: (item.totalStock || 0) + quantity,
+                warehouseBreakdown: {
+                  ...(item.warehouseBreakdown || {}),
+                  [warehouse]: ((item.warehouseBreakdown || {})[warehouse] || 0) + quantity
+                }
               }
             : item
         );
       }
-
       return [
         ...prev,
         {
-          category,
-          warehouseA: warehouse === 'Oton Main Warehouse' ? quantity : 0,
-          warehouseB: warehouse === 'Pototan Main Warehouse' ? quantity : 0
+          category: canonical || category,
+          warehouseA: isOton ? quantity : 0,
+          warehouseB: isPototan ? quantity : 0,
+          totalStock: quantity,
+          warehouseBreakdown: { [warehouse]: quantity }
         }
       ];
+    });
+
+    // 3. Persist to Supabase warehouses table
+    backendApi.addWarehouseStock(warehouse, category, quantity).catch(err => {
+      console.warn('backendApi.addWarehouseStock error:', err);
     });
   };
 
   const deductStock = (category: string, warehouse: WarehouseName, quantity: number): boolean => {
-    const item = inventory.find(i => i.category === category);
+    const canonical = normalizeCategoryName(category);
+    const item = inventory.find(i => normalizeCategoryName(i.category) === canonical || i.category.toLowerCase() === category.toLowerCase());
     if (!item) return false;
 
-    const currentStock = warehouse === 'Oton Main Warehouse' ? item.warehouseA : item.warehouseB;
+    const currentStock = item.warehouseBreakdown?.[warehouse] ??
+      (warehouse.toLowerCase().includes('oton') ? item.warehouseA : item.warehouseB);
     if (currentStock < quantity) return false;
 
+    const isOton = warehouse.toLowerCase().includes('oton');
+    const isPototan = warehouse.toLowerCase().includes('pototan');
+
+    setWarehousesList(prev => prev.map(wh => {
+      const match = wh.name.toLowerCase().includes(isOton ? 'oton' : 'pototan');
+      if (!match) return wh;
+
+      const catLower = category.toLowerCase();
+      const updated = { ...wh };
+      if (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) updated.foodPacks = Math.max(0, (updated.foodPacks || 0) - quantity);
+      else if (canonical === 'Hygiene Kit' || catLower.includes('hygiene')) updated.hygieneKits = Math.max(0, (updated.hygieneKits || 0) - quantity);
+      else if (canonical === 'Sleeping Kit' || catLower.includes('sleeping')) updated.sleepingKits = Math.max(0, (updated.sleepingKits || 0) - quantity);
+      else if (canonical === 'Kitchen Kit' || catLower.includes('kitchen')) updated.kitchenKits = Math.max(0, (updated.kitchenKits || 0) - quantity);
+      else if (canonical === 'Family Kit' || catLower.includes('family kit')) updated.familyKits = Math.max(0, (updated.familyKits || 0) - quantity);
+      else if (canonical === 'Laminated Sacks' || canonical === 'Laminated Sack' || catLower.includes('sack')) updated.laminatedSacks = Math.max(0, (updated.laminatedSacks || 0) - quantity);
+      else if (canonical === 'Ready-to-Eat Food (RTEF)' || canonical === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) updated.rtef = Math.max(0, (updated.rtef || 0) - quantity);
+
+      const currentMap = { ...(updated.currentStock || {}) };
+      const curVal = currentMap[canonical] !== undefined ? currentMap[canonical] : (currentMap[category] ?? 0);
+      const nextVal = Math.max(0, curVal - quantity);
+      if (canonical) currentMap[canonical] = nextVal;
+      currentMap[category] = nextVal;
+      updated.currentStock = currentMap;
+      return updated;
+    }));
+
     setInventory(prev =>
-      prev.map(item =>
-        item.category === category
+      prev.map(it =>
+        (normalizeCategoryName(it.category) === canonical || it.category.toLowerCase() === category.toLowerCase())
           ? {
-              ...item,
-              warehouseA: warehouse === 'Oton Main Warehouse' ? item.warehouseA - quantity : item.warehouseA,
-              warehouseB: warehouse === 'Pototan Main Warehouse' ? item.warehouseB - quantity : item.warehouseB
+              ...it,
+              warehouseA: isOton ? Math.max(0, it.warehouseA - quantity) : it.warehouseA,
+              warehouseB: isPototan ? Math.max(0, it.warehouseB - quantity) : it.warehouseB,
+              totalStock: Math.max(0, (it.totalStock || 0) - quantity),
+              warehouseBreakdown: {
+                ...(it.warehouseBreakdown || {}),
+                [warehouse]: Math.max(0, ((it.warehouseBreakdown || {})[warehouse] || 0) - quantity)
+              }
             }
-          : item
+          : it
       )
     );
+
+    backendApi.deductWarehouseStock(warehouse, category, quantity).catch(err => {
+      console.warn('backendApi.deductWarehouseStock error:', err);
+    });
 
     return true;
   };
 
   const getAvailableStock = (category: string, warehouse: WarehouseName): number => {
-    const item = inventory.find(i => i.category === category);
-    if (!item) return 0;
-    return warehouse === 'Oton Main Warehouse' ? item.warehouseA : item.warehouseB;
+    const canonical = normalizeCategoryName(category);
+    const targetWh = warehousesList.find(w => w.name.toLowerCase() === warehouse.toLowerCase());
+    if (targetWh) {
+      const catLower = category.toLowerCase();
+      if (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) return targetWh.foodPacks;
+      if (canonical === 'Hygiene Kit' || catLower.includes('hygiene')) return targetWh.hygieneKits;
+      if (canonical === 'Sleeping Kit' || catLower.includes('sleeping')) return targetWh.sleepingKits;
+      if (canonical === 'Kitchen Kit' || catLower.includes('kitchen')) return targetWh.kitchenKits;
+      if (canonical === 'Family Kit' || catLower.includes('family kit')) return targetWh.familyKits;
+      if (canonical === 'Laminated Sacks' || canonical === 'Laminated Sack' || catLower.includes('sack')) return targetWh.laminatedSacks;
+      if (canonical === 'Ready-to-Eat Food (RTEF)' || canonical === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) return targetWh.rtef;
+      if (targetWh.currentStock) {
+        if (targetWh.currentStock[category] !== undefined) return targetWh.currentStock[category];
+        if (targetWh.currentStock[canonical] !== undefined) return targetWh.currentStock[canonical];
+      }
+    }
+    const item = inventory.find(i => normalizeCategoryName(i.category) === canonical || i.category.toLowerCase() === category.toLowerCase());
+    return item?.warehouseBreakdown?.[warehouse] || (warehouse.toLowerCase().includes('oton') ? item?.warehouseA : item?.warehouseB) || 0;
+  };
+
+  const addLguStock = (municipality: string, category: string, quantity: number, province?: string) => {
+    const targetNorm = normalizeLguName(municipality);
+    const catLower = category.toLowerCase();
+    const canonical = normalizeCategoryName(category);
+
+    setLgusList(prev => prev.map(lgu => {
+      const lguNorm = normalizeLguName(lgu.municipality);
+      const matchMuni = lgu.municipality.toLowerCase() === municipality.toLowerCase()
+        || (targetNorm.length > 0 && lguNorm.length > 0 && targetNorm === lguNorm)
+        || lgu.municipality.toLowerCase().includes(targetNorm)
+        || targetNorm.includes(lgu.municipality.toLowerCase());
+      const matchProv = !province || lgu.province.toLowerCase() === province.toLowerCase();
+      if (!matchMuni || !matchProv) return lgu;
+
+      const updated = { ...lgu };
+      if (canonical === 'Ready-to-Eat Food (RTEF)' || canonical === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) updated.rtef = (updated.rtef || 0) + quantity;
+      else if (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) updated.foodPacks = (updated.foodPacks || 0) + quantity;
+      else if (catLower.includes('hygiene') || canonical === 'Hygiene Kit') updated.hygieneKits = (updated.hygieneKits || 0) + quantity;
+      else if (catLower.includes('family') || canonical === 'Family Kit') updated.familyKits = (updated.familyKits || 0) + quantity;
+      else if (catLower.includes('sleeping') || canonical === 'Sleeping Kit') updated.sleepingKits = (updated.sleepingKits || 0) + quantity;
+      else if (catLower.includes('kitchen') || canonical === 'Kitchen Kit') updated.kitchenKits = (updated.kitchenKits || 0) + quantity;
+      else if (catLower.includes('sack') || canonical === 'Laminated Sacks' || canonical === 'Laminated Sack') updated.laminatedSacks = (updated.laminatedSacks || 0) + quantity;
+      else updated.foodPacks = (updated.foodPacks || 0) + quantity;
+
+      const currentMap = { ...(updated.currentStock || {}) };
+      const canonicalKey = canonical || category;
+      currentMap[canonicalKey] = (currentMap[canonicalKey] || 0) + quantity;
+      if (category !== canonicalKey) {
+        currentMap[category] = currentMap[canonicalKey];
+      }
+      updated.currentStock = currentMap;
+      return updated;
+    }));
+
+    setLguPriorityReports(prev => prev.map(rep => {
+      const repNorm = normalizeLguName(rep.municipality);
+      const matchMuni = rep.municipality.toLowerCase() === municipality.toLowerCase()
+        || (targetNorm.length > 0 && repNorm.length > 0 && targetNorm === repNorm)
+        || rep.municipality.toLowerCase().includes(targetNorm)
+        || targetNorm.includes(rep.municipality.toLowerCase());
+      const matchProv = !province || rep.province.toLowerCase() === province.toLowerCase();
+      if (!matchMuni || !matchProv) return rep;
+
+      const isFood = (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) && !catLower.includes('rtef') && !catLower.includes('ready-to-eat');
+      const updatedFood = isFood ? (rep.foodPacks || 0) + quantity : rep.foodPacks;
+      const updatedHygiene = (catLower.includes('hygiene') || canonical === 'Hygiene Kit') ? (rep.hygieneKits || 0) + quantity : rep.hygieneKits;
+      const updatedFamily = (catLower.includes('family') || canonical === 'Family Kit') ? (rep.familyKits || 0) + quantity : rep.familyKits;
+      const maxStock = Number(rep.maxStock) > 0 ? Number(rep.maxStock) : 3000;
+
+      const evalRes = evaluatePriorityIndicator({
+        foodPacks: updatedFood,
+        affectedFamilies: rep.affectedFamilies,
+        targetQuota: maxStock
+      });
+
+      return {
+        ...rep,
+        foodPacks: updatedFood,
+        hygieneKits: updatedHygiene,
+        familyKits: updatedFamily,
+        urgencyScore: evalRes.urgencyScore,
+        priorityColor: evalRes.priorityColor,
+        priorityLevel: evalRes.priorityLevel,
+        stockRate: evalRes.stockRate,
+        completionRate: evalRes.completionRate,
+        effectiveRate: evalRes.effectiveRate,
+        systemResponse: evalRes.systemResponse
+      };
+    }));
+
+    backendApi.addLguStock(municipality, category, quantity, province).catch(err => {
+      console.warn('backendApi.addLguStock error:', err);
+    });
+  };
+
+  const deductLguStock = (municipality: string, category: string, quantity: number, province?: string): boolean => {
+    const targetNorm = normalizeLguName(municipality);
+    const catLower = category.toLowerCase();
+    const canonical = normalizeCategoryName(category);
+
+    setLgusList(prev => prev.map(lgu => {
+      const lguNorm = normalizeLguName(lgu.municipality);
+      const matchMuni = lgu.municipality.toLowerCase() === municipality.toLowerCase()
+        || (targetNorm.length > 0 && lguNorm.length > 0 && targetNorm === lguNorm)
+        || lgu.municipality.toLowerCase().includes(targetNorm)
+        || targetNorm.includes(lgu.municipality.toLowerCase());
+      const matchProv = !province || lgu.province.toLowerCase() === province.toLowerCase();
+      if (!matchMuni || !matchProv) return lgu;
+
+      const updated = { ...lgu };
+      if (canonical === 'Ready-to-Eat Food (RTEF)' || canonical === 'RTEF' || catLower.includes('rtef') || catLower.includes('ready-to-eat')) updated.rtef = Math.max(0, (updated.rtef || 0) - quantity);
+      else if (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) updated.foodPacks = Math.max(0, (updated.foodPacks || 0) - quantity);
+      else if (catLower.includes('hygiene') || canonical === 'Hygiene Kit') updated.hygieneKits = Math.max(0, (updated.hygieneKits || 0) - quantity);
+      else if (catLower.includes('family') || canonical === 'Family Kit') updated.familyKits = Math.max(0, (updated.familyKits || 0) - quantity);
+      else if (catLower.includes('sleeping') || canonical === 'Sleeping Kit') updated.sleepingKits = Math.max(0, (updated.sleepingKits || 0) - quantity);
+      else if (catLower.includes('kitchen') || canonical === 'Kitchen Kit') updated.kitchenKits = Math.max(0, (updated.kitchenKits || 0) - quantity);
+      else if (catLower.includes('sack') || canonical === 'Laminated Sacks' || canonical === 'Laminated Sack') updated.laminatedSacks = Math.max(0, (updated.laminatedSacks || 0) - quantity);
+      else updated.foodPacks = Math.max(0, (updated.foodPacks || 0) - quantity);
+
+      const currentMap = { ...(updated.currentStock || {}) };
+      const canonicalKey = canonical || category;
+      currentMap[canonicalKey] = Math.max(0, (currentMap[canonicalKey] || 0) - quantity);
+      if (category !== canonicalKey) {
+        currentMap[category] = currentMap[canonicalKey];
+      }
+      updated.currentStock = currentMap;
+      return updated;
+    }));
+
+    setLguPriorityReports(prev => prev.map(rep => {
+      const repNorm = normalizeLguName(rep.municipality);
+      const matchMuni = rep.municipality.toLowerCase() === municipality.toLowerCase()
+        || (targetNorm.length > 0 && repNorm.length > 0 && targetNorm === repNorm)
+        || rep.municipality.toLowerCase().includes(targetNorm)
+        || targetNorm.includes(rep.municipality.toLowerCase());
+      const matchProv = !province || rep.province.toLowerCase() === province.toLowerCase();
+      if (!matchMuni || !matchProv) return rep;
+
+      const isFood = (canonical === 'Family Food Pack' || canonical === 'Food Pack' || catLower.includes('food pack')) && !catLower.includes('rtef') && !catLower.includes('ready-to-eat');
+      const updatedFood = isFood ? Math.max(0, (rep.foodPacks || 0) - quantity) : rep.foodPacks;
+      const updatedHygiene = (catLower.includes('hygiene') || canonical === 'Hygiene Kit') ? Math.max(0, (rep.hygieneKits || 0) - quantity) : rep.hygieneKits;
+      const updatedFamily = (catLower.includes('family') || canonical === 'Family Kit') ? Math.max(0, (rep.familyKits || 0) - quantity) : rep.familyKits;
+      const maxStock = Number(rep.maxStock) > 0 ? Number(rep.maxStock) : 3000;
+
+      const evalRes = evaluatePriorityIndicator({
+        foodPacks: updatedFood,
+        affectedFamilies: rep.affectedFamilies,
+        targetQuota: maxStock
+      });
+
+      return {
+        ...rep,
+        foodPacks: updatedFood,
+        hygieneKits: updatedHygiene,
+        familyKits: updatedFamily,
+        urgencyScore: evalRes.urgencyScore,
+        priorityColor: evalRes.priorityColor,
+        priorityLevel: evalRes.priorityLevel,
+        stockRate: evalRes.stockRate,
+        completionRate: evalRes.completionRate,
+        effectiveRate: evalRes.effectiveRate,
+        systemResponse: evalRes.systemResponse
+      };
+    }));
+
+    backendApi.deductLguStock(municipality, category, quantity).catch(err => {
+      console.warn('backendApi.deductLguStock error:', err);
+    });
+
+    return true;
+  };
+
+  const editLgu = async (id: string, updates: Partial<LguInput>): Promise<{ ok: boolean; message: string }> => {
+    try {
+      setLgusList(prev => prev.map(lgu => {
+        if (lgu.id !== id) return lgu;
+        const initial = updates.initialStock || {};
+        const canonicalInitial: Record<string, number> = {};
+        Object.entries(initial).forEach(([k, v]) => {
+          const canonical = normalizeCategoryName(k);
+          const val = Number(v) || 0;
+          if (canonical) canonicalInitial[canonical] = val;
+          canonicalInitial[k] = val;
+        });
+
+        const nextCurrentStock = updates.initialStock
+          ? { ...(lgu.currentStock || {}), ...canonicalInitial }
+          : lgu.currentStock;
+
+        return {
+          ...lgu,
+          ...updates,
+          foodPacks: canonicalInitial['Family Food Pack'] !== undefined ? canonicalInitial['Family Food Pack'] : (canonicalInitial['Food Pack'] !== undefined ? canonicalInitial['Food Pack'] : lgu.foodPacks),
+          hygieneKits: canonicalInitial['Hygiene Kit'] !== undefined ? canonicalInitial['Hygiene Kit'] : lgu.hygieneKits,
+          sleepingKits: canonicalInitial['Sleeping Kit'] !== undefined ? canonicalInitial['Sleeping Kit'] : lgu.sleepingKits,
+          kitchenKits: canonicalInitial['Kitchen Kit'] !== undefined ? canonicalInitial['Kitchen Kit'] : lgu.kitchenKits,
+          familyKits: canonicalInitial['Family Kit'] !== undefined ? canonicalInitial['Family Kit'] : lgu.familyKits,
+          laminatedSacks: canonicalInitial['Laminated Sacks'] !== undefined ? canonicalInitial['Laminated Sacks'] : (canonicalInitial['Laminated Sack'] !== undefined ? canonicalInitial['Laminated Sack'] : lgu.laminatedSacks),
+          rtef: canonicalInitial['Ready-to-Eat Food (RTEF)'] !== undefined ? canonicalInitial['Ready-to-Eat Food (RTEF)'] : (canonicalInitial['RTEF'] !== undefined ? canonicalInitial['RTEF'] : lgu.rtef),
+          maxStock: updates.maxStock !== undefined ? Number(updates.maxStock) || 3000 : (lgu.maxStock ?? 3000),
+          currentStock: nextCurrentStock
+        };
+      }));
+
+      setLguPriorityReports(prev => prev.map(rep => {
+        if (rep.id !== id && rep.municipality.toLowerCase() !== (updates.municipality || '').toLowerCase()) return rep;
+        const targetLgu = lgusList.find(l => l.id === id);
+        const updatedFood = updates.initialStock?.['Family Food Pack'] !== undefined ? updates.initialStock['Family Food Pack'] : (updates.initialStock?.['Food Pack'] !== undefined ? updates.initialStock['Food Pack'] : rep.foodPacks);
+        const maxStock = updates.maxStock !== undefined ? Number(updates.maxStock) || 3000 : (Number(rep.maxStock) || Number(targetLgu?.maxStock) || 3000);
+        const affectedFamilies = updates.affectedFamilies !== undefined ? Number(updates.affectedFamilies) : rep.affectedFamilies;
+        const evalRes = evaluatePriorityIndicator({
+          foodPacks: updatedFood,
+          affectedFamilies,
+          targetQuota: maxStock
+        });
+        return {
+          ...rep,
+          foodPacks: updatedFood,
+          hygieneKits: updates.initialStock?.['Hygiene Kit'] !== undefined ? updates.initialStock['Hygiene Kit'] : rep.hygieneKits,
+          familyKits: updates.initialStock?.['Family Kit'] !== undefined ? updates.initialStock['Family Kit'] : rep.familyKits,
+          maxStock,
+          urgencyScore: evalRes.urgencyScore,
+          priorityColor: evalRes.priorityColor,
+          priorityLevel: evalRes.priorityLevel,
+          stockRate: evalRes.stockRate,
+          completionRate: evalRes.completionRate,
+          effectiveRate: evalRes.effectiveRate,
+          systemResponse: evalRes.systemResponse
+        };
+      }));
+
+      await backendApi.updateLgu(id, updates);
+
+      backendApi.logActivity({
+        action: 'LGU_UPDATED',
+        entityType: 'LGU',
+        entityId: id,
+        actorId: currentActor.id,
+        actorName: currentActor.name,
+        actorEmail: currentActor.email,
+        actorRole: currentActor.role,
+        actorWallet: currentActor.wallet,
+        details: `Updated master parameters for LGU ${updates.municipality || id}.`,
+        metadata: { id, updates }
+      }).catch(() => {});
+
+      return { ok: true, message: 'LGU profile updated successfully.' };
+    } catch (err: any) {
+      return { ok: false, message: err?.message || 'Failed to update LGU in database.' };
+    }
+  };
+
+  const addLgu = async (input: LguInput): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const res = await backendApi.createLgu(input);
+      const newRecord: LguRecord = {
+        id: res.id,
+        municipality: input.municipality,
+        province: input.province,
+        lguName: input.lguName,
+        latitude: input.latitude ?? 10.7870,
+        longitude: input.longitude ?? 122.3892,
+        contactPerson: input.contactPerson || '',
+        contactNumber: input.contactNumber || '',
+        remarks: input.remarks || '',
+        maxStock: input.maxStock !== undefined ? Number(input.maxStock) || 3000 : 3000,
+        currentStock: input.initialStock || {},
+        foodPacks: input.initialStock?.['Food Pack'] || 0,
+        hygieneKits: input.initialStock?.['Hygiene Kit'] || 0,
+        familyKits: input.initialStock?.['Family Kit'] || 0,
+        sleepingKits: input.initialStock?.['Sleeping Kit'] || 0,
+        kitchenKits: input.initialStock?.['Kitchen Kit'] || 0,
+        laminatedSacks: input.initialStock?.['Laminated Sack'] || 0,
+        rtef: input.initialStock?.['RTEF'] || 0,
+        urgencyScore: 20,
+        priorityColor: 'Green',
+        recommendation: 'Stable baseline stock',
+        affectedFamilies: input.affectedFamilies || 0,
+        damageIndex: 0,
+        isActive: true
+      };
+      setLgusList(prev => [...prev, newRecord]);
+
+      backendApi.logActivity({
+        action: 'LGU_CREATED',
+        entityType: 'LGU',
+        entityId: res.id,
+        actorId: currentActor.id,
+        actorName: currentActor.name,
+        actorEmail: currentActor.email,
+        actorRole: currentActor.role,
+        actorWallet: currentActor.wallet,
+        details: `Created LGU municipality ${input.municipality}, ${input.province} with max quota ${input.maxStock || 3000}.`,
+        metadata: { id: res.id, municipality: input.municipality, province: input.province }
+      }).catch(() => {});
+
+      return { ok: true, message: 'LGU created successfully.' };
+    } catch (err: any) {
+      return { ok: false, message: err?.message || 'Failed to create LGU in database.' };
+    }
   };
 
   const addIncomingGoods = (newGoods: Omit<IncomingGoods, 'id' | 'status' | 'manifestHash' | 'auditTrail'>) => {
-    const newId = `INC-2026-${String(incomingGoodsList.length + 1).padStart(3, '0')}`;
+    const rawRis = (newGoods.manifestNumber || '').trim();
+    if (!rawRis) {
+      console.error('Cannot add incoming goods: RIS number is strictly required.');
+      return;
+    }
+    const upperRis = rawRis.toUpperCase();
+    const cleanId = upperRis.startsWith('RIS-') || upperRis.startsWith('DR-')
+      ? upperRis
+      : `RIS-${upperRis}`;
+    const isLgu = newGoods.destinationType === 'LGU';
+    const initialStatus: IncomingStatus = 'Pending Verification';
+    const auditMessage = isLgu
+      ? `Incoming direct delivery to ${newGoods.destination} recorded under ${cleanId} awaiting physical verification & stock.`
+      : `Incoming manifest ${cleanId} recorded awaiting physical warehouse verification & stock.`;
+
+    const uniqueLocalId = `INC-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const goodsWithId: IncomingGoods = {
       ...newGoods,
-      id: newId,
-      status: 'Draft',
+      id: uniqueLocalId,
+      manifestNumber: cleanId,
+      status: initialStatus,
       manifestHash: makeManifestHash(newGoods),
-      auditTrail: [makeAudit('Draft Created', 'Incoming manifest saved as editable draft. No blockchain minting yet.')]
+      verifiedBy: undefined,
+      auditTrail: [audit('Draft Created', auditMessage)]
     };
     setIncomingGoodsList(prev => [goodsWithId, ...prev]);
+
+    // Physical warehouse and LGU buffer stocks are updated strictly upon physical inspection & verification (verifyIncomingReceipt)
     backendApi.createIncoming({
       ...newGoods,
-      manifestNumber: newId,
-      status: 'Draft',
-      manifestHash: goodsWithId.manifestHash
-    }).then(() => {
+      manifestNumber: cleanId,
+      status: initialStatus,
+      manifestHash: goodsWithId.manifestHash,
+      supplySourceId: newGoods.supplySourceId,
+      kitTypeId: newGoods.kitTypeId,
+      destinationWarehouseId: newGoods.destinationWarehouseId,
+      destinationLguId: newGoods.destinationLguId
+    }).then((created) => {
+      if (created?.id) {
+        setIncomingGoodsList(prev => prev.map(item => item.id === uniqueLocalId ? { ...item, id: created.id } : item));
+      }
       setIntegrationMode('backend');
     }).catch(error => {
       logBackendError('Create incoming manifest')(error);
       setIntegrationMode('mock');
     });
+
+    backendApi.logActivity({
+      action: 'INCOMING_ADDED',
+      entityType: 'IncomingGoods',
+      entityId: cleanId,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Created incoming manifest ${cleanId} with ${newGoods.quantity} ${newGoods.unitType || 'units'} of ${newGoods.fnfiCategory} from ${newGoods.source} to ${newGoods.destination}.`,
+      metadata: {
+        manifestNumber: cleanId,
+        category: newGoods.fnfiCategory,
+        quantity: newGoods.quantity,
+        unitType: newGoods.unitType,
+        source: newGoods.source,
+        destination: newGoods.destination
+      }
+    }).catch(() => {});
+  };
+
+  const replenishLguTransfer = async (payload: LguReplenishPayload): Promise<{ ok: boolean; message?: string }> => {
+    const rawRis = (payload.manifestNumber || '').trim();
+    if (!rawRis) {
+      return { ok: false, message: 'Transfer RIS control number is strictly required.' };
+    }
+    const cleanId = rawRis.toUpperCase();
+
+    // 1. Same-LGU prevention check
+    if (payload.sourceType === 'LGU' && payload.sourceName.trim().toLowerCase() === payload.destinationMunicipality.trim().toLowerCase()) {
+      return { ok: false, message: 'Source and Destination cannot be the same LGU.' };
+    }
+
+    if (payload.quantity <= 0) {
+      return { ok: false, message: 'Transfer quantity must be greater than 0.' };
+    }
+
+    // 2. Validate source stock availability
+    if (payload.sourceType === 'Warehouse') {
+      const whStock = getAvailableStock(payload.fnfiCategory, payload.sourceName as WarehouseName);
+      if (payload.quantity > whStock) {
+        return { ok: false, message: `Insufficient stock at ${payload.sourceName}. Only ${whStock.toLocaleString()} available.` };
+      }
+    } else {
+      const srcLgu = lgusList.find(l => l.municipality.toLowerCase() === payload.sourceName.toLowerCase());
+      const lguStock = getLguCategoryStock(srcLgu, payload.fnfiCategory);
+      if (payload.quantity > lguStock) {
+        return { ok: false, message: `Insufficient stock at ${payload.sourceName}. Only ${lguStock.toLocaleString()} available.` };
+      }
+    }
+
+    // 3. Deduct from Source (Pure Off-Chain Database & Local State)
+    if (payload.sourceType === 'Warehouse') {
+      deductStock(payload.fnfiCategory, payload.sourceName as WarehouseName, payload.quantity);
+    } else {
+      deductLguStock(payload.sourceName, payload.fnfiCategory, payload.quantity, payload.sourceProvince);
+    }
+
+    // 4. Add to Destination (Pure Off-Chain Database & Local State)
+    addLguStock(payload.destinationMunicipality, payload.fnfiCategory, payload.quantity, payload.destinationProvince);
+
+    // 5. Append Stock Ledger double-entry records
+    const sourceWh = payload.sourceType === 'Warehouse' ? warehousesList.find(w => w.name.toLowerCase() === payload.sourceName.toLowerCase()) : undefined;
+    const sourceLgu = payload.sourceType === 'LGU' ? lgusList.find(l => l.municipality.toLowerCase() === payload.sourceName.toLowerCase()) : undefined;
+    const destLgu = lgusList.find(l => l.municipality.toLowerCase() === payload.destinationMunicipality.toLowerCase());
+    const matchedKit = kitTypesList.find(k => k.name.toLowerCase() === payload.fnfiCategory.toLowerCase());
+    const kitTypeId = matchedKit?.id || payload.fnfiCategory;
+
+    // First create incoming manifest in database to have real UUID
+    let createdManifestId: string | undefined;
+    const manifestHash = `OFFCHAIN-DR-${Date.now()}`;
+    try {
+      const incRes = await backendApi.createIncoming({
+        manifestNumber: cleanId,
+        dateReceived: payload.transferDate,
+        fnfiCategory: payload.fnfiCategory,
+        quantity: payload.quantity,
+        unitType: payload.unitType || 'packs',
+        expirationDate: payload.expirationDate,
+        source: payload.sourceType === 'Warehouse' ? payload.sourceName : `${payload.sourceName} LGU Prepositioned Site`,
+        destinationType: 'LGU',
+        destination: payload.destinationMunicipality,
+        destinationLguId: destLgu?.id,
+        status: 'Verified',
+        manifestHash
+      });
+      if (incRes?.id) createdManifestId = incRes.id;
+    } catch (err) {
+      console.warn('createIncoming error:', err);
+    }
+
+    // Append Stock Ledger double-entry records with linked manifest ID
+    backendApi.appendStockLedger({
+      facilityType: payload.sourceType,
+      warehouseId: sourceWh?.id,
+      lguId: sourceLgu?.id,
+      kitTypeId: kitTypeId,
+      deltaQuantity: -payload.quantity,
+      movementType: 'TRANSFER_OUT',
+      referenceManifestId: createdManifestId || cleanId,
+      manifestNumber: cleanId,
+      actorProfileId: currentActor.id
+    }).catch(err => console.warn('appendStockLedger TRANSFER_OUT error:', err));
+
+    backendApi.appendStockLedger({
+      facilityType: 'LGU',
+      lguId: destLgu?.id,
+      kitTypeId: kitTypeId,
+      deltaQuantity: payload.quantity,
+      movementType: 'TRANSFER_IN',
+      referenceManifestId: createdManifestId || cleanId,
+      manifestNumber: cleanId,
+      actorProfileId: currentActor.id
+    }).catch(err => console.warn('appendStockLedger TRANSFER_IN error:', err));
+
+    // 6. Deduct specific batch lot if allocated
+    if (payload.batchTokenId) {
+      setInventoryBatchesList(prev => prev.map(b =>
+        b.batchTokenId === payload.batchTokenId
+          ? { ...b, remainingQuantity: Math.max(0, b.remainingQuantity - payload.quantity) }
+          : b
+      ));
+      backendApi.allocateBatchesToRequest(cleanId, [{ batchTokenId: payload.batchTokenId, quantity: payload.quantity }])
+        .catch(err => console.warn('allocateBatchesToRequest error:', err));
+    }
+
+    // 7. Record destination inventory batch (Zero blockchain, strictly database)
+    const newBatchToken = `BATCH-${cleanId}`;
+    backendApi.createInventoryBatch({
+      batchTokenId: newBatchToken,
+      incomingManifestId: createdManifestId || cleanId,
+      kitTypeId: kitTypeId,
+      initialQuantity: payload.quantity,
+      remainingQuantity: payload.quantity,
+      lguId: destLgu?.id,
+      expirationDate: payload.expirationDate,
+      manifestHash,
+      mintedByProfileId: currentActor.id
+    }).catch(err => console.warn('createInventoryBatch error:', err));
+
+    setInventoryBatchesList(prev => [
+      {
+        batchTokenId: newBatchToken,
+        incomingManifestId: cleanId,
+        kitTypeId: kitTypeId,
+        initialQuantity: payload.quantity,
+        remainingQuantity: payload.quantity,
+        lguId: destLgu?.id,
+        expirationDate: payload.expirationDate,
+        mintedAt: new Date().toISOString()
+      },
+      ...prev
+    ]);
+
+    // 8. Record in incoming_goods table and local state
+    const goodsWithId: IncomingGoods = {
+      id: cleanId,
+      manifestNumber: cleanId,
+      dateReceived: payload.transferDate,
+      fnfiCategory: payload.fnfiCategory,
+      quantity: payload.quantity,
+      unitType: payload.unitType || 'packs',
+      expirationDate: payload.expirationDate,
+      source: payload.sourceType === 'Warehouse' ? payload.sourceName : `${payload.sourceName} LGU Prepositioned Site`,
+      destinationType: 'LGU',
+      destination: payload.destinationMunicipality,
+      destinationLguId: destLgu?.id,
+      status: 'Verified',
+      verifiedBy: currentActor.name,
+      manifestHash,
+      batchTokenId: newBatchToken,
+      auditTrail: [
+        audit('Stock Replenished', `Replenished ${payload.destinationMunicipality} with ${payload.quantity.toLocaleString()} ${payload.unitType || 'packs'} of ${payload.fnfiCategory} from ${payload.sourceName} (Exp: ${payload.expirationDate}) verified and stocked by ${currentActor.name}.`)
+      ]
+    };
+    setIncomingGoodsList(prev => [goodsWithId, ...prev]);
+
+    backendApi.logActivity({
+      action: 'LGU_REPLENISHED',
+      entityType: 'Replenishment',
+      entityId: cleanId,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Replenished ${payload.destinationMunicipality} with ${payload.quantity.toLocaleString()} ${payload.unitType || 'packs'} of ${payload.fnfiCategory} from ${payload.sourceName} (Exp: ${payload.expirationDate}).`,
+      metadata: {
+        manifestNumber: cleanId,
+        source: payload.sourceName,
+        destination: payload.destinationMunicipality,
+        quantity: payload.quantity,
+        fnfiCategory: payload.fnfiCategory,
+        expirationDate: payload.expirationDate,
+        batchTokenId: payload.batchTokenId
+      }
+    }).catch(() => {});
+
+    return {
+      ok: true,
+      message: `Successfully replenished ${payload.destinationMunicipality} with ${payload.quantity.toLocaleString()} ${payload.unitType || 'packs'} of ${payload.fnfiCategory} from ${payload.sourceName}.`
+    };
   };
 
   const updateIncomingGoods = (id: string, patch: Partial<IncomingGoods>) => {
+    const existing = incomingGoodsList.find(item => item.id === id);
+
     setIncomingGoodsList(prev => prev.map(item => {
-      if (item.id !== id || item.status === 'Minted') return item;
+      if (item.id !== id) return item;
       const updated = { ...item, ...patch };
       return {
         ...updated,
         manifestHash: makeManifestHash(updated),
-        auditTrail: [makeAudit('Edited', 'Pre-tokenization record edited to correct human encoding error.'), ...item.auditTrail]
+        auditTrail: [audit('Edited', 'Draft receiving record edited to correct human encoding error.'), ...item.auditTrail]
       };
     }));
+
+    // Adjust stock difference if quantity changed on verified manifest (or corrected manifest previously verified)
+    const wasVerified = existing && (existing.status === 'Verified' || existing.auditTrail?.some(a => a.action === 'Verified & Stocked'));
+    if (existing && wasVerified && patch.quantity !== undefined && patch.quantity !== existing.quantity) {
+      const diff = patch.quantity - existing.quantity;
+      const cat = patch.fnfiCategory || existing.fnfiCategory;
+      const dest = patch.destination || existing.destination;
+      const destType = patch.destinationType || existing.destinationType;
+      if (destType === 'Warehouse') {
+        const whName = isMainWarehouse(dest) ? dest : (normalizeWarehouseName(dest) || 'Oton Main Warehouse');
+        addStock(cat, whName as WarehouseName, diff);
+      } else if (destType === 'LGU') {
+        addLguStock(dest, cat, diff);
+      }
+    }
+
+    backendApi.updateIncoming(id, {
+      status: patch.status,
+      incidentCode: patch.incidentCode,
+      category: patch.fnfiCategory,
+      quantity: patch.quantity,
+      unitType: patch.unitType,
+      expirationDate: patch.expirationDate,
+      source: patch.source,
+      destinationType: patch.destinationType,
+      destination: patch.destination,
+      correctionNote: patch.correctionNote
+    }).catch(error => {
+      logBackendError('Update incoming goods')(error);
+      setIntegrationMode('mock');
+    });
+
+    backendApi.logActivity({
+      action: 'INCOMING_EDITED',
+      entityType: 'IncomingGoods',
+      entityId: id,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Edited incoming manifest ${id} parameters.`,
+      metadata: { manifestNumber: id, ...patch }
+    }).catch(() => {});
   };
 
   const submitIncomingForVerification = (id: string) => {
     setIncomingGoodsList(prev => prev.map(item => item.id === id && item.status === 'Draft'
-      ? { ...item, status: 'Pending Verification', auditTrail: [makeAudit('Submitted for Verification', 'Draft locked for warehouse review.'), ...item.auditTrail] }
+      ? { ...item, status: 'Pending Verification', auditTrail: [audit('Submitted for Verification', 'Draft locked for warehouse review.'), ...item.auditTrail] }
       : item));
     backendApi.updateIncoming(id, { status: 'Pending Verification' }).catch(error => {
       logBackendError('Submit incoming manifest')(error);
       setIntegrationMode('mock');
     });
+
+    backendApi.logActivity({
+      action: 'INCOMING_SUBMITTED',
+      entityType: 'IncomingGoods',
+      entityId: id,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Submitted incoming manifest ${id} for physical warehouse inspection and verification.`,
+      metadata: { manifestNumber: id }
+    }).catch(() => {});
   };
 
   const verifyIncomingReceipt = (id: string) => {
-    setIncomingGoodsList(prev => prev.map(item => item.id === id && item.status === 'Pending Verification'
-      ? { ...item, status: 'Verified', verifiedBy: 'Warehouse Supervisor', auditTrail: [makeAudit('Verified', 'Physical count and manifest details verified.'), ...item.auditTrail] }
+    const target = incomingGoodsList.find(item => item.id === id || item.manifestNumber === id);
+    const wasAlreadyVerified = Boolean(target?.auditTrail?.some(a => a.action === 'Verified & Stocked'));
+
+    if (target && !wasAlreadyVerified) {
+      if (target.destinationType === 'LGU') {
+        addLguStock(target.destination, target.fnfiCategory, target.quantity);
+      } else if (target.destinationType === 'Warehouse') {
+        const whName = isMainWarehouse(target.destination)
+          ? target.destination
+          : (normalizeWarehouseName(target.destination) || 'Oton Main Warehouse');
+        addStock(target.fnfiCategory, whName as WarehouseName, target.quantity);
+      }
+
+      backendApi.createInventoryBatch({
+        batchTokenId: `BATCH-${target.manifestNumber || target.id}`,
+        incomingManifestId: target.id,
+        kitTypeId: target.kitTypeId || target.fnfiCategory || 'kit_food_pack',
+        initialQuantity: target.quantity,
+        remainingQuantity: target.quantity,
+        warehouseId: target.destinationWarehouseId,
+        lguId: target.destinationLguId,
+        expirationDate: target.expirationDate,
+        manifestHash: target.manifestHash,
+        mintedByProfileId: currentActor.id,
+        mintedAt: new Date().toISOString()
+      }).catch(err => console.warn('createInventoryBatch error:', err));
+
+      backendApi.appendStockLedger({
+        facilityType: target.destinationType,
+        warehouseId: target.destinationWarehouseId,
+        lguId: target.destinationLguId,
+        kitTypeId: target.kitTypeId || target.fnfiCategory || 'Family Food Pack',
+        deltaQuantity: target.quantity,
+        balanceAfter: target.quantity,
+        movementType: 'INTAKE_VERIFIED',
+        referenceManifestId: target.id,
+        manifestNumber: target.manifestNumber || target.id,
+        actorProfileId: currentActor.id
+      }).catch(err => console.warn('appendStockLedger error:', err));
+    }
+
+    setIncomingGoodsList(prev => prev.map(item => (item.id === id || item.manifestNumber === id)
+      ? {
+          ...item,
+          status: 'Verified',
+          correctionNote: undefined,
+          verifiedBy: currentActor.name,
+          auditTrail: [audit('Verified & Stocked', `Physical count and manifest details verified and stocked into inventory by ${currentActor.name}.`), ...item.auditTrail]
+        }
       : item));
-    backendApi.updateIncoming(id, { status: 'Verified' }).catch(error => {
+
+    const targetKey = target?.id || id;
+    backendApi.updateIncoming(targetKey, {
+      status: 'Verified',
+      verifiedBy: currentActor.name,
+      verifiedByProfileId: currentActor.id,
+      correctionNote: null as any
+    }).catch(error => {
       logBackendError('Verify incoming manifest')(error);
       setIntegrationMode('mock');
     });
-  };
 
-  const mintBatchToken = async (id: string) => {
-    const item = incomingGoodsList.find(item => item.id === id);
-    if (!item || item.status !== 'Verified') return { ok: false, message: 'Only verified manifests can be minted.' };
-
-    const duplicate = incomingGoodsList.find(other => other.id !== id && other.status === 'Minted' && other.manifestHash === item.manifestHash);
-    if (duplicate) return { ok: false, message: `Duplicate manifest detected. Existing token: ${duplicate.batchTokenId}` };
-
-    const tokenId = `BATCH-2026-${String(incomingGoodsList.filter(i => i.batchTokenId).length + 1).padStart(3, '0')}`;
-    let proof;
-
-    try {
-      proof = await blockchain.mintBatchToken({
-        manifestNumber: item.id,
-        batchTokenId: tokenId,
-        manifestHash: item.manifestHash,
-        category: item.fnfiCategory,
-        quantity: item.quantity,
-        destination: item.destination
-      });
-    } catch (error) {
-      logBackendError('Mint batch token with MetaMask')(error);
-      return { ok: false, message: error instanceof Error ? error.message : 'MetaMask minting was cancelled or failed.' };
+    if (target?.manifestNumber && target.manifestNumber !== targetKey) {
+      backendApi.updateIncoming(target.manifestNumber, {
+        status: 'Verified',
+        verifiedBy: currentActor.name,
+        verifiedByProfileId: currentActor.id,
+        correctionNote: null as any
+      }).catch(() => {});
     }
 
-    const mintedAt = nowStamp();
+    backendApi.logActivity({
+      action: 'INCOMING_VERIFIED',
+      entityType: 'IncomingGoods',
+      entityId: id,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Verified physical incoming manifest ${id} by ${currentActor.name}. Physical count and warehouse inventory verified.`,
+      metadata: { manifestNumber: id, verifiedBy: currentActor.name }
+    }).catch(() => {});
+  };
 
-    setIncomingGoodsList(prev => prev.map(incoming => incoming.id === id
+  const cancelIncomingGoods = async (id: string): Promise<{ ok: boolean; message?: string }> => {
+    const target = incomingGoodsList.find(item => item.id === id);
+    if (!target) return { ok: false, message: 'Incoming delivery record not found.' };
+    if (target.status === 'Verified') {
+      return { ok: false, message: 'Verified and stocked inventory cannot be cancelled.' };
+    }
+
+    setIncomingGoodsList(prev => prev.map(item => item.id === id
       ? {
-          ...incoming,
-          status: 'Minted',
-          batchTokenId: tokenId,
-          blockchainTxHash: proof.hash,
-          mintedAt,
-          auditTrail: [makeAudit('Batch Token Minted', `Manifest hash ${incoming.manifestHash} minted as ${tokenId}.`, proof.hash), ...incoming.auditTrail]
+          ...item,
+          status: 'Cancelled' as IncomingStatus,
+          auditTrail: [audit('Cancelled', `Incoming delivery intake cancelled by ${currentActor.name}.`), ...item.auditTrail]
         }
-      : incoming));
+      : item
+    ));
 
-    backendApi.updateIncoming(id, {
-      status: 'Minted',
-      manifestHash: item.manifestHash,
-      txHash: proof.hash,
-      batchTokenId: tokenId,
-      mintedAt,
-      walletAddress: proof.walletAddress
-    }).catch(error => {
-      logBackendError('Mint incoming manifest')(error);
-      setIntegrationMode('mock');
-    });
+    try {
+      await backendApi.updateIncoming(id, { status: 'Cancelled' });
+      backendApi.logActivity({
+        action: 'INCOMING_CANCELLED',
+        entityType: 'IncomingGoods',
+        entityId: id,
+        actorId: currentActor.id,
+        actorName: currentActor.name,
+        actorEmail: currentActor.email,
+        actorRole: currentActor.role,
+        actorWallet: currentActor.wallet,
+        details: `Cancelled incoming delivery ${id} by ${currentActor.name}.`,
+        metadata: { manifestNumber: target.manifestNumber || id, quantity: target.quantity }
+      }).catch(() => {});
+      return { ok: true };
+    } catch (err: any) {
+      logBackendError('Cancel incoming manifest')(err);
+      return { ok: false, message: err?.message || 'Failed to update cancellation in database.' };
+    }
+  };
 
-    return { ok: true, message: `${tokenId} minted and stock posted via ${proof.mode === 'contract' ? 'blockchain transaction' : 'MetaMask signature proof'}.` };
+  const mintBatchToken = async (_id: string, _actorRole: UserRole = 'Admin') => {
+    return { ok: true, message: 'Incoming manifests are verified and stocked off-chain without blockchain tokens.' };
   };
 
   const requestIncomingCorrection = (id: string, note: string) => {
+    const newReport: DiscrepancyReport = {
+      id: `DISC-${Date.now()}`,
+      reportType: 'Incoming',
+      manifestNumber: id,
+      note,
+      reportedAt: nowStamp()
+    };
+    setDiscrepancyReports(prev => [newReport, ...prev]);
+
     setIncomingGoodsList(prev => prev.map(item => item.id === id
-      ? { ...item, status: 'Correction Requested', correctionNote: note, auditTrail: [makeAudit('Correction Requested', note), ...item.auditTrail] }
+      ? { ...item, status: 'Correction Requested', correctionNote: note, auditTrail: [audit('Correction Requested', note), ...item.auditTrail] }
       : item));
-    backendApi.updateIncoming(id, { status: 'Correction Requested' }).catch(error => {
+    backendApi.updateIncoming(id, { status: 'Correction Requested', correctionNote: note }).catch(error => {
       logBackendError('Request incoming correction')(error);
       setIntegrationMode('mock');
     });
+    backendApi.createDiscrepancyReport({
+      reportType: 'Incoming',
+      manifestNumber: id,
+      note,
+      reportedByProfileId: currentActor.id,
+      reportedByRole: currentActor.role,
+      reportedByWallet: currentActor.wallet
+    }).catch(error => {
+      logBackendError('Create incoming discrepancy report')(error);
+      setIntegrationMode('mock');
+    });
+
+    backendApi.logActivity({
+      action: 'CORRECTION_REQUESTED',
+      entityType: 'IncomingGoods',
+      entityId: id,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Discrepancy flagged and correction requested for incoming manifest ${id}: ${note}`,
+      metadata: { manifestNumber: id, note, reportType: 'Incoming' }
+    }).catch(() => {});
   };
 
-  const addOutgoingRelease = (newRelease: Omit<OutgoingRelease, 'drNumber' | 'allocatedBatchTokenIds' | 'auditTrail'>) => {
-    const newDR = `DR-2026-${String(outgoingReleasesList.length + 1).padStart(3, '0')}`;
-    const status: OutgoingStatus = newRelease.deliveryStatus === 'Released' ? 'Approved' : newRelease.deliveryStatus;
+  const addOutgoingRelease = (newRelease: Omit<OutgoingRelease, 'drNumber' | 'allocatedBatches' | 'auditTrail'> & { allocatedBatches?: BatchAllocation[] }) => {
+    const maxKnownIndex = outgoingReleasesList.reduce((max, release) => {
+      const match = release.drNumber.match(/(?:DR|INC)-\d{4}-(\d+)/i);
+      if (!match) return max;
+      const value = Number.parseInt(match[1], 10);
+      return Number.isFinite(value) ? Math.max(max, value) : max;
+    }, 0);
+    // On-chain safe floor: Handovers 1, 2, 3, 4 already exist on Sepolia testnet
+    const nextIndex = Math.max(maxKnownIndex, 4) + 1;
+    const year = new Date().getFullYear();
+    const newIncCode = `INC-${year}-${String(nextIndex).padStart(3, '0')}`;
+    backendApi.getNextDrIndex().catch(() => {});
+    const status: OutgoingStatus = newRelease.deliveryStatus === 'Released' ? 'Approved' : (newRelease.deliveryStatus || 'Allocating');
+    const matchedLgu = lgusList.find(l =>
+      (newRelease.lguId && l.id === newRelease.lguId) ||
+      (newRelease.municipality && l.municipality.toLowerCase() === newRelease.municipality.toLowerCase()) ||
+      (newRelease.lguName && l.lguName.toLowerCase() === newRelease.lguName.toLowerCase())
+    );
+    const resolvedLguId = newRelease.lguId || (matchedLgu ? matchedLgu.id : undefined);
+
+    const initialBatches: BatchAllocation[] = (newRelease as any).allocatedBatches || [];
+
     const releaseWithDR: OutgoingRelease = {
       ...newRelease,
+      lguId: resolvedLguId,
       deliveryStatus: status,
-      drNumber: newDR,
+      drNumber: newIncCode,
       amountApproved: status === 'Draft' || status === 'Allocating' ? 0 : newRelease.amountApproved,
-      allocatedBatchTokenIds: [],
-      auditTrail: [makeAudit('Release Draft Created', 'Outgoing request saved before blockchain custody transfer.')]
+      allocatedBatches: initialBatches,
+      auditTrail: [audit('Release Draft Created', 'Outgoing request saved before blockchain custody transfer.')]
     };
     setOutgoingReleasesList(prev => [releaseWithDR, ...prev]);
+
     backendApi.createOutgoing({
       ...newRelease,
-      drNumber: newDR,
-      deliveryStatus: 'Allocating'
+      lguId: resolvedLguId,
+      destinationLguId: resolvedLguId,
+      drNumber: newIncCode,
+      amountApproved: newRelease.amountApproved,
+      deliveryStatus: status,
+      allocatedBatches: initialBatches,
+      receiverGps: newRelease.receiverGps,
+      destinationAddress: newRelease.destinationAddress,
+      assignedTruckId: newRelease.assignedTruckId,
+      assignedEscortProfileId: newRelease.assignedEscortProfileId,
+      sourceWarehouseId: newRelease.sourceWarehouseId,
+      sourceLguId: newRelease.sourceLguId,
+      kitTypeId: newRelease.kitTypeId,
+      sourceType: newRelease.sourceType
     }).then(() => {
       setIntegrationMode('backend');
     }).catch(error => {
       logBackendError('Create outgoing request')(error);
       setIntegrationMode('mock');
     });
+
+    // Outgoing release created in Draft/Allocating status:
+    // Proposed FEFO batch allocations are recorded as reservations. Stock deduction is deferred strictly to Admin approval.
+
+    backendApi.logActivity({
+      action: 'RELEASE_CREATED',
+      entityType: 'OutgoingRelease',
+      entityId: newIncCode,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Created outgoing release request ${newIncCode} for ${newRelease.lguName} (${newRelease.amountRequested} units of ${newRelease.fnfiCategory} via ${newRelease.deliveryMode}).`,
+      metadata: {
+        drNumber: newIncCode,
+        lguName: newRelease.lguName,
+        municipality: newRelease.municipality,
+        province: newRelease.province,
+        category: newRelease.fnfiCategory,
+        amountRequested: newRelease.amountRequested,
+        deliveryMode: newRelease.deliveryMode,
+        warehouseSource: newRelease.warehouseSource
+      }
+    }).catch(() => {});
   };
 
   const updateOutgoingRelease = (drNumber: string, patch: Partial<OutgoingRelease>) => {
@@ -500,64 +1811,320 @@ export function useInventoryState() {
       return {
         ...release,
         ...patch,
-        auditTrail: [makeAudit('Edited', 'Pre-handover release details edited before immutable custody event.'), ...release.auditTrail]
+        auditTrail: [audit('Edited', 'Pre-handover release details edited before immutable custody event.'), ...release.auditTrail]
       };
     }));
+
+    void backendApi.updateOutgoing(drNumber, {
+      amountApproved: patch.amountApproved,
+      deliveryStatus: patch.deliveryStatus,
+      allocatedBatches: patch.allocatedBatches,
+      receiverGps: patch.receiverGps,
+      destinationAddress: patch.destinationAddress
+    }).catch(err => console.warn('Supabase updateOutgoing error:', err));
+
+    backendApi.logActivity({
+      action: 'RELEASE_EDITED',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Edited outgoing release parameters for ${drNumber}.`,
+      metadata: { drNumber, ...patch }
+    }).catch(() => {});
   };
 
-  const approveAllocation = (drNumber: string, amountApproved: number) => {
+  const approveAllocation = async (drNumber: string, amountApproved: number): Promise<{ ok: boolean; message: string }> => {
     const release = outgoingReleasesList.find(item => item.drNumber === drNumber);
     if (!release) return { ok: false, message: 'Release not found.' };
-    if (amountApproved <= 0 || amountApproved > release.amountRequested) return { ok: false, message: 'Approved amount must be between 1 and requested amount.' };
+    if (amountApproved <= 0 || amountApproved > release.amountRequested) {
+      return { ok: false, message: 'Approved amount must be between 1 and requested amount.' };
+    }
+
+    // Validate available regional warehouse stock
     if (isMainWarehouse(release.warehouseSource) && getAvailableStock(release.fnfiCategory, release.warehouseSource) < amountApproved) {
       return { ok: false, message: 'Insufficient available warehouse stock.' };
     }
 
-    const availableTokens = incomingGoodsList
-      .filter(item => item.status === 'Minted' && item.fnfiCategory === release.fnfiCategory)
-      .map(item => item.batchTokenId!)
-      .filter(Boolean);
+    const cleanDr = release.drNumber.replace(/[^a-zA-Z0-9]/g, '');
+    let allocations: BatchAllocation[];
+    if (release.allocatedBatches && release.allocatedBatches.length > 0) {
+      if (release.allocatedBatches.length === 1) {
+        const b = release.allocatedBatches[0];
+        const authenticTokenId = (b.batchTokenId && !b.batchTokenId.includes(cleanDr))
+          ? b.batchTokenId
+          : (b.batchNumber ? `BATCH-${b.batchNumber}` : `BATCH-${cleanDr}`);
+        allocations = [{
+          ...b,
+          batchNumber: b.batchNumber || b.batchTokenId?.replace(/^BATCH-/, '') || release.drNumber,
+          batchTokenId: authenticTokenId,
+          quantity: amountApproved
+        }];
+      } else {
+        let remaining = amountApproved;
+        const mapped: BatchAllocation[] = [];
+        for (let idx = 0; idx < release.allocatedBatches.length; idx++) {
+          const b = release.allocatedBatches[idx];
+          if (remaining <= 0) break;
+          const authenticTokenId = (b.batchTokenId && !b.batchTokenId.includes(cleanDr))
+            ? b.batchTokenId
+            : (b.batchNumber ? `BATCH-${b.batchNumber}` : `BATCH-${cleanDr}-${idx + 1}`);
+          if (idx === release.allocatedBatches.length - 1) {
+            mapped.push({
+              ...b,
+              batchNumber: b.batchNumber || b.batchTokenId?.replace(/^BATCH-/, '') || release.drNumber,
+              batchTokenId: authenticTokenId,
+              quantity: remaining
+            });
+            remaining = 0;
+          } else {
+            const rawBQty = Number(b.quantity) || 0;
+            const takeQty = Math.min(rawBQty, remaining);
+            if (takeQty > 0) {
+              mapped.push({
+                ...b,
+                batchNumber: b.batchNumber || b.batchTokenId?.replace(/^BATCH-/, '') || release.drNumber,
+                batchTokenId: authenticTokenId,
+                quantity: takeQty
+              });
+              remaining -= takeQty;
+            }
+          }
+        }
+        if (remaining > 0 && mapped.length > 0) {
+          mapped[mapped.length - 1].quantity += remaining;
+        }
+        allocations = mapped.length > 0
+          ? mapped
+          : [{ batchTokenId: `BATCH-${cleanDr}`, batchNumber: release.drNumber, quantity: amountApproved }];
+      }
+    } else {
+      allocations = [{ batchTokenId: `BATCH-${cleanDr}`, batchNumber: release.drNumber, quantity: amountApproved }];
+    }
+
+    let proof: any;
+
+    try {
+      await blockchain.requireConnectedWalletRole('Admin');
+      // Mint authentic allocated batches onto Sepolia
+      for (const batch of allocations) {
+        proof = await blockchain.mintAndAuthorizeRelease({
+          drNumber: release.drNumber,
+          batchTokenId: batch.batchTokenId,
+          category: release.fnfiCategory,
+          quantity: Number(batch.quantity) || amountApproved,
+          warehouseSource: release.warehouseSource,
+          lguName: release.lguName
+        });
+      }
+    } catch (error) {
+      logBackendError('Mint and authorize release on blockchain')(error);
+      return { ok: false, message: toFriendlyTxError(error, 'Authorization and batch minting failed. Administrator privileges required.') };
+    }
+
+    const mintedBatchId = allocations[0]?.batchTokenId || 'BATCH';
+    const batchTokenId = allocations.map(b => b.batchTokenId).join(', ') || mintedBatchId;
 
     setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber
       ? {
           ...item,
           amountApproved,
           deliveryStatus: 'Approved',
-          allocatedBatchTokenIds: availableTokens.slice(0, 2),
-          auditTrail: [makeAudit('Allocation Approved', 'Stock reserved and tokenized batches assigned; no custody transfer yet.'), ...item.auditTrail]
+          allocatedBatches: allocations,
+          adminSignature: proof?.hash,
+          blockchainTxHash: proof?.hash,
+          auditTrail: [audit('Release Minted & Authorized', `Admin authorized dispatch and verified batch ${mintedBatchId} on blockchain.`, proof?.hash), ...item.auditTrail]
         }
       : item));
-    backendApi.updateOutgoing(drNumber, {
-      amountApproved,
-      deliveryStatus: 'Approved'
-    }).catch(error => {
+
+    try {
+      await backendApi.updateOutgoing(drNumber, {
+        amountApproved,
+        deliveryStatus: 'Approved',
+        allocatedBatches: allocations,
+        txHash: proof.hash,
+        adminSignature: proof.hash,
+        walletAddress: proof.walletAddress,
+        approvedByProfileId: currentActor.id
+      });
+      setIntegrationMode('backend');
+    } catch (error) {
       logBackendError('Approve outgoing allocation')(error);
       setIntegrationMode('mock');
-    });
-    return { ok: true, message: 'Allocation approved and token batches assigned.' };
+    }
+
+    // Allocate batches in relational DB and append dispatch to stock ledger
+    backendApi.allocateBatchesToRequest(drNumber, allocations).catch(err => console.warn('allocateBatchesToRequest error:', err));
+    backendApi.appendStockLedger({
+      facilityType: (release.sourceType || 'Warehouse'),
+      warehouseId: release.sourceWarehouseId,
+      lguId: release.sourceLguId,
+      kitTypeId: release.kitTypeId || release.fnfiCategory || 'Family Food Pack',
+      deltaQuantity: -amountApproved,
+      balanceAfter: 0,
+      movementType: 'RELEASE_DISPATCHED',
+      referenceDrId: drNumber,
+      drNumber: drNumber,
+      actorProfileId: currentActor.id
+    }).catch(err => console.warn('appendStockLedger error:', err));
+
+    backendApi.logActivity({
+      action: 'RELEASE_APPROVED',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      details: `Admin approved release ${drNumber} (${amountApproved} units of ${release.fnfiCategory}) for ${release.lguName}. Batch token ${batchTokenId} minted on blockchain.`,
+      txHash: proof.hash,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: 'Admin',
+      actorWallet: proof.walletAddress,
+      metadata: {
+        drNumber,
+        batchTokenId,
+        amountApproved,
+        lguName: release.lguName,
+        category: release.fnfiCategory,
+        warehouseSource: release.warehouseSource,
+        txHash: proof.hash
+      }
+    }).catch(() => {});
+
+    // Deduct stock from the source warehouse or source LGU in Supabase & local state strictly upon approval
+    if (allocations && allocations.length > 0) {
+      backendApi.applyDateBatchDeductions(
+        drNumber,
+        allocations,
+        release.sourceType || 'Warehouse',
+        release.warehouseSource,
+        release.fnfiCategory
+      ).catch(err => console.warn('Supabase applyDateBatchDeductions error:', err));
+    } else if (isMainWarehouse(release.warehouseSource)) {
+      backendApi.deductWarehouseStock(release.warehouseSource, release.fnfiCategory, amountApproved)
+        .catch(err => console.warn('Supabase deductWarehouseStock error:', err));
+    } else if (release.warehouseSource && (release.sourceType === 'LGU' || !isMainWarehouse(release.warehouseSource))) {
+      backendApi.deductLguStock(release.warehouseSource, release.fnfiCategory, amountApproved)
+        .catch(err => console.warn('Supabase deductLguStock error:', err));
+    }
+
+    if (isMainWarehouse(release.warehouseSource)) {
+      setWarehousesList(prev => {
+        const updated = prev.map(wh => {
+          const matchName = release.warehouseSource.replace(/main|warehouse/gi, '').trim().toLowerCase();
+          if (!wh.name.toLowerCase().includes(matchName)) return wh;
+          const catLower = release.fnfiCategory.toLowerCase();
+          const newWh = { ...wh };
+          if (catLower.includes('food pack')) newWh.foodPacks = Math.max(0, wh.foodPacks - amountApproved);
+          else if (catLower.includes('hygiene')) newWh.hygieneKits = Math.max(0, wh.hygieneKits - amountApproved);
+          else if (catLower.includes('sleeping')) newWh.sleepingKits = Math.max(0, wh.sleepingKits - amountApproved);
+          else if (catLower.includes('kitchen')) newWh.kitchenKits = Math.max(0, wh.kitchenKits - amountApproved);
+          else if (catLower.includes('family kit')) newWh.familyKits = Math.max(0, wh.familyKits - amountApproved);
+          else if (catLower.includes('sack')) newWh.laminatedSacks = Math.max(0, wh.laminatedSacks - amountApproved);
+          else if (catLower.includes('rtef') || catLower.includes('ready-to-eat')) newWh.rtef = Math.max(0, wh.rtef - amountApproved);
+
+          if (newWh.currentStock && newWh.currentStock[release.fnfiCategory] !== undefined) {
+            newWh.currentStock = {
+              ...newWh.currentStock,
+              [release.fnfiCategory]: Math.max(0, newWh.currentStock[release.fnfiCategory] - amountApproved)
+            };
+          }
+          return newWh;
+        });
+        setInventory(calculateWarehouseInventory(updated, kitTypesList));
+        return updated;
+      });
+    }
+
+    // Deduct batches in local state for instantaneous FEFO reflect
+    if (allocations && allocations.length > 0) {
+      setInventoryBatchesList(prev => prev.map(batch => {
+        const matchAlloc = allocations.find(a =>
+          a.batchTokenId === batch.batchTokenId ||
+          (a.batchNumber && batch.batchTokenId.includes(a.batchNumber))
+        );
+        if (matchAlloc) {
+          return {
+            ...batch,
+            remainingQuantity: Math.max(0, batch.remainingQuantity - (Number(matchAlloc.quantity) || 0))
+          };
+        }
+        return batch;
+      }));
+    }
+
+    return { ok: true, message: `Release approved! Batch token ${batchTokenId} minted on blockchain with Admin signature.` };
   };
 
-  const senderSignAndRelease = async (drNumber: string) => {
+  const cancelOutgoingRelease = async (drNumber: string): Promise<{ ok: boolean; message?: string }> => {
+    const release = outgoingReleasesList.find(r => r.drNumber === drNumber);
+    if (!release) return { ok: false, message: 'Release not found.' };
+    if (!['Draft', 'Allocating'].includes(release.deliveryStatus)) {
+      return { ok: false, message: 'Only pre-approval releases (Draft or Allocating) can be cancelled.' };
+    }
+
+    try {
+      // 1. Call backendApi to cancel in Supabase
+      const res = await backendApi.cancelOutgoingRequest(drNumber);
+      if (!res.ok) {
+        return { ok: false, message: res.message || 'Failed to cancel outgoing request in database.' };
+      }
+
+      // 2. Update outgoing releases list: mark as Cancelled
+      setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber
+        ? {
+            ...item,
+            deliveryStatus: 'Cancelled',
+            allocatedBatches: [],
+            amountApproved: 0,
+            auditTrail: [
+              audit('Release Cancelled', 'Outgoing request cancelled before approval.'),
+              ...item.auditTrail
+            ]
+          }
+        : item));
+
+      return { ok: true, message: `Release ${drNumber} has been cancelled.` };
+    } catch (err: any) {
+      logBackendError('Cancel outgoing release')(err);
+      return { ok: false, message: err?.message || 'Failed to cancel release.' };
+    }
+  };
+
+  const senderSignAndRelease = async (drNumber: string, actorRole: UserRole = 'Receiver') => {
+    if (actorRole !== 'Receiver') return { ok: false, message: 'RBAC: only Receiver can sign warehouse release.' };
     const release = outgoingReleasesList.find(item => item.drNumber === drNumber);
     if (!release || !['Approved', 'Packed'].includes(release.deliveryStatus)) return { ok: false, message: 'Only approved/packed releases can be signed by sender.' };
+    if (release.allocatedBatches.length === 0) {
+      return { ok: false, message: 'No batch allocations found for this release.' };
+    }
 
-    const senderGps = release.warehouseSource === 'Pototan Main Warehouse' ? '11.0039, 122.5364' : '10.6922, 122.4731';
-    const handoverContractId = `HANDOVER-${drNumber.replace('DR-', '')}`;
+    const targetWarehouse = warehousesList.find(w => w.name.toLowerCase() === (release.warehouseSource || '').toLowerCase());
+    const senderGps = targetWarehouse
+      ? `${targetWarehouse.latitude.toFixed(5)}, ${targetWarehouse.longitude.toFixed(5)}`
+      : '10.6975, 122.4764'; // Authoritative Oton main warehouse origin coordinate
+    const handoverContractId = release.handoverContractId || (drNumber.startsWith('HANDOVER-') ? drNumber : `HANDOVER-${drNumber}`);
     let proof;
 
     try {
+      await blockchain.requireConnectedWalletRole('Receiver');
+      await blockchain.assertBatchTokensExist(release.allocatedBatches.map(batch => batch.batchTokenId));
       proof = await blockchain.signRelease({
         drNumber,
         handoverContractId,
         category: release.fnfiCategory,
         quantity: release.amountApproved || release.amountRequested,
+        batchTokenIds: release.allocatedBatches.map(batch => batch.batchTokenId),
+        batchQuantities: release.allocatedBatches.map(batch => batch.quantity),
         from: release.warehouseSource,
         to: release.lguName,
         gps: senderGps
       });
     } catch (error) {
-      logBackendError('Sign release with MetaMask')(error);
-      return { ok: false, message: error instanceof Error ? error.message : 'MetaMask release signing was cancelled or failed.' };
+      logBackendError('Sign release on blockchain')(error);
+      return { ok: false, message: toFriendlyTxError(error, 'Sign release failed. Please try again.') };
     }
 
     setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber
@@ -568,7 +2135,7 @@ export function useInventoryState() {
           senderSignature: proof.hash,
           senderGps,
           blockchainTxHash: proof.hash,
-          auditTrail: [makeAudit('Sender Signed Handover', 'Warehouse signed release; GPS origin captured and custody transfer opened.', proof.hash), ...item.auditTrail]
+          auditTrail: [audit('Sender Signed Handover', 'Warehouse signed release; GPS origin captured and custody transfer opened.', proof.hash), ...item.auditTrail]
         }
       : item));
     backendApi.updateOutgoing(drNumber, {
@@ -577,47 +2144,124 @@ export function useInventoryState() {
       txHash: proof.hash,
       handoverContractId,
       senderSignature: proof.hash,
-      walletAddress: proof.walletAddress
+      walletAddress: proof.walletAddress,
+      dispatchedByProfileId: currentActor.id
     }).catch(error => {
       logBackendError('Sign outgoing release')(error);
       setIntegrationMode('mock');
     });
-    return { ok: true, message: `Sender signature recorded via ${proof.mode === 'contract' ? 'blockchain transaction' : 'MetaMask signature proof'}.` };
-  };
 
-  const markInTransit = (drNumber: string) => {
-    setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber && item.deliveryStatus === 'Released'
-      ? { ...item, deliveryStatus: 'In Transit', auditTrail: [makeAudit('In Transit', 'Shipment is moving to destination LGU.'), ...item.auditTrail] }
-      : item));
-    backendApi.updateOutgoing(drNumber, { deliveryStatus: 'In Transit' }).catch(error => {
-      logBackendError('Mark outgoing in transit')(error);
-      setIntegrationMode('mock');
-    });
-  };
-
-  const receiverAcceptWithGps = async (drNumber: string) => {
-    const release = outgoingReleasesList.find(item => item.drNumber === drNumber);
-    if (!release) return { ok: false, message: 'Release not found.' };
-    const latestGps = release?.municipality === 'Miag-ao' ? '10.6415, 122.2352' : release?.municipality === 'Banate' ? '11.0022, 122.8174' : '10.7202, 122.5621';
-    const handoverContractId = release.handoverContractId ?? `HANDOVER-${drNumber.replace('DR-', '')}`;
-    let proof;
-
-    try {
-      proof = await blockchain.confirmReceipt({
+    backendApi.logActivity({
+      action: 'SIGN_RELEASE',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      details: `Signed custody handover for ${drNumber} departing ${release.warehouseSource} to ${release.lguName}.`,
+      txHash: proof.hash,
+      actorRole: 'Receiver',
+      actorWallet: proof.walletAddress,
+      metadata: {
         drNumber,
         handoverContractId,
         category: release.fnfiCategory,
         quantity: release.amountApproved || release.amountRequested,
         from: release.warehouseSource,
         to: release.lguName,
-        gps: latestGps
-      });
-    } catch (error) {
-      logBackendError('Confirm receipt with MetaMask')(error);
-      return { ok: false, message: error instanceof Error ? error.message : 'MetaMask receipt confirmation was cancelled or failed.' };
+        gps: senderGps,
+        txHash: proof.hash
+      }
+    }).catch(() => {});
+
+    return { ok: true, message: `Sender signature recorded via ${proof.mode === 'contract' ? 'blockchain transaction' : 'cryptographic signature proof'}.` };
+  };
+
+  const markInTransit = (drNumber: string) => {
+    setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber && item.deliveryStatus === 'Released'
+      ? { ...item, deliveryStatus: 'In Transit', auditTrail: [audit('In Transit', 'Shipment is moving to destination LGU.'), ...item.auditTrail] }
+      : item));
+    backendApi.updateOutgoing(drNumber, { deliveryStatus: 'In Transit' }).catch(error => {
+      logBackendError('Mark outgoing in transit')(error);
+      setIntegrationMode('mock');
+    });
+
+    backendApi.logActivity({
+      action: 'RELEASE_DISPATCHED',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Dispatched relief cargo ${drNumber}; status marked In Transit to destination LGU.`,
+      metadata: { drNumber }
+    }).catch(() => {});
+  };
+
+  const receiverAcceptWithGps = async (
+    drNumber: string,
+    actorRole: UserRole = 'LGUReceiver',
+    actorLguMunicipality?: string,
+    explicitGps?: string
+  ) => {
+    if (actorRole !== 'LGUReceiver') return { ok: false, message: 'RBAC: only LGUReceiver can confirm receipt.' };
+    const targetDrUpper = drNumber.trim().toUpperCase();
+    const release = outgoingReleasesList.find(item =>
+      item.drNumber.trim().toUpperCase() === targetDrUpper &&
+      ['In Transit', 'Delivered', 'Released', 'Approved', 'Packed'].includes(item.deliveryStatus)
+    ) || outgoingReleasesList.find(item => item.drNumber.trim().toUpperCase() === targetDrUpper);
+    if (!release) return { ok: false, message: 'Release not found.' };
+    const canonicalDr = release.drNumber;
+
+    // Strict Destination Validation:
+    if (actorLguMunicipality && actorLguMunicipality.trim()) {
+      const cleanActorMuni = actorLguMunicipality.trim().toLowerCase();
+      const releaseMuni = (release.municipality || '').trim().toLowerCase();
+      const releaseLgu = (release.lguName || '').trim().toLowerCase();
+      const releaseDest = (release.destinationAddress || '').trim().toLowerCase();
+
+      const matches = releaseMuni.includes(cleanActorMuni) ||
+                      cleanActorMuni.includes(releaseMuni) ||
+                      releaseLgu.includes(cleanActorMuni) ||
+                      cleanActorMuni.includes(releaseLgu) ||
+                      releaseDest.includes(cleanActorMuni);
+
+      if (!matches) {
+        return {
+          ok: false,
+          message: `Mismatched Destination: Shipment ${canonicalDr} is designated for "${release.municipality || release.lguName || 'another LGU'}", not ${actorLguMunicipality}. Receipt rejected.`
+        };
+      }
     }
 
-    setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber && ['Released', 'In Transit', 'Delivered'].includes(item.deliveryStatus)
+    // Chain of Custody Validation:
+    // Allow In Transit / Delivered shipments, as well as Direct LGU Pickup (Released / Approved / Packed)
+    if (!['In Transit', 'Delivered', 'Released', 'Approved', 'Packed'].includes(release.deliveryStatus)) {
+      return {
+        ok: false,
+        message: `Shipment ${canonicalDr} is currently "${release.deliveryStatus}". It cannot be accepted in its current state.`
+      };
+    }
+
+    const lguLookup = findMatchingLgu(lgusList, release?.destinationAddress || release?.lguName || release?.municipality || '', release?.province);
+    const latestGps = explicitGps || release?.receiverGps || (lguLookup ? `${lguLookup.latitude.toFixed(5)}, ${lguLookup.longitude.toFixed(5)}` : '10.7202, 122.5621');
+    const handoverContractId = release.handoverContractId || `HANDOVER-${canonicalDr}`;
+    let proof: { hash: string; walletAddress: string; mode: 'contract' | 'signature' };
+
+    try {
+      proof = await blockchain.confirmReceipt({
+        drNumber: canonicalDr,
+        handoverContractId,
+        destination: '',
+        gps: latestGps,
+        signerWallet: currentActor.wallet || undefined
+      });
+    } catch (confErr: any) {
+      console.warn('LGU confirmReceipt error:', confErr);
+      const msg = confErr?.message || 'Blockchain confirmation failed or was cancelled.';
+      return { ok: false, message: msg };
+    }
+
+    setOutgoingReleasesList(prev => prev.map(item => item.drNumber.trim().toUpperCase() === targetDrUpper && ['In Transit', 'Delivered', 'Released', 'Approved', 'Packed'].includes(item.deliveryStatus)
       ? {
           ...item,
           deliveryStatus: 'Accepted',
@@ -625,67 +2269,643 @@ export function useInventoryState() {
           receiverSignature: proof.hash,
           receiverGps: latestGps,
           blockchainTxHash: proof.hash,
-          auditTrail: [makeAudit('Receiver Accepted', 'LGU signed receipt; GPS coordinates captured and custody transfer completed.', proof.hash), ...item.auditTrail]
+          auditTrail: [audit('Receiver Accepted', 'LGU signed receipt; GPS coordinates captured and custody transfer completed.', proof.hash), ...item.auditTrail]
         }
       : item));
-    backendApi.updateOutgoing(drNumber, {
+    // Note: Outgoing delivery confirmation strictly confirms receipt and does NOT store goods into LGU inventory.
+    // LGU warehouse stock is stored strictly via incoming goods intake or explicit physical stock audit reports.
+
+    backendApi.updateOutgoing(canonicalDr, {
       deliveryStatus: 'Accepted',
       receiverGps: latestGps,
       txHash: proof.hash,
       handoverContractId,
       receiverSignature: proof.hash,
-      walletAddress: proof.walletAddress
+      walletAddress: proof.walletAddress,
+      receivedByProfileId: currentActor.id
+    }).then(() => {
+      backendApi.markTruckLiveLocationDoneByDr(canonicalDr).catch(() => {});
     }).catch(error => {
       logBackendError('Accept outgoing handover')(error);
-      setIntegrationMode('mock');
     });
 
-    return { ok: true, message: `Receiver confirmation recorded via ${proof.mode === 'contract' ? 'blockchain transaction' : 'MetaMask signature proof'}.` };
+    backendApi.logActivity({
+      action: 'CONFIRM_RECEIPT',
+      entityType: 'OutgoingRelease',
+      entityId: canonicalDr,
+      details: `Confirmed physical receipt of delivery ${canonicalDr} at ${release.lguName}. Handover finalized on-chain.`,
+      txHash: proof.hash,
+      actorRole: 'LGUReceiver',
+      actorWallet: proof.walletAddress,
+      metadata: {
+        drNumber: canonicalDr,
+        destination: release.lguName,
+        gps: latestGps,
+        txHash: proof.hash
+      }
+    }).catch(() => {});
+
+    return { ok: true, message: `Receiver confirmation recorded via ${proof.mode === 'contract' ? 'blockchain transaction' : 'cryptographic signature proof'}.`, txHash: proof.hash };
+  };
+
+  const adminEmergencyBypassAccept = async (
+    drNumber: string,
+    reason: string
+  ): Promise<{ ok: boolean; message: string; txHash?: string }> => {
+    if (!adminActionsEnabled) {
+      return { ok: false, message: 'Administrative Mode must be enabled in Settings to execute an emergency bypass.' };
+    }
+    const cleanReason = (reason || '').trim();
+    if (!cleanReason) {
+      return { ok: false, message: 'An emergency authorization reason / incident note is required.' };
+    }
+
+    const targetDrUpper = drNumber.trim().toUpperCase();
+    const release = outgoingReleasesList.find(item =>
+      item.drNumber.trim().toUpperCase() === targetDrUpper &&
+      ['In Transit', 'Delivered', 'Released', 'Approved', 'Packed'].includes(item.deliveryStatus)
+    ) || outgoingReleasesList.find(item => item.drNumber.trim().toUpperCase() === targetDrUpper);
+    if (!release) return { ok: false, message: 'Release not found.' };
+    const canonicalDr = release.drNumber;
+
+    if (!['In Transit', 'Delivered', 'Released', 'Approved', 'Packed'].includes(release.deliveryStatus)) {
+      return {
+        ok: false,
+        message: `Shipment ${canonicalDr} is currently "${release.deliveryStatus}". It cannot be bypassed in its current state.`
+      };
+    }
+
+    const lguLookup = findMatchingLgu(lgusList, release?.destinationAddress || release?.lguName || release?.municipality || '', release?.province);
+    const bypassGps = release?.receiverGps || (lguLookup ? `${lguLookup.latitude.toFixed(5)}, ${lguLookup.longitude.toFixed(5)}` : '10.7202, 122.5621');
+    const handoverContractId = release.handoverContractId || `HANDOVER-${canonicalDr}`;
+
+    let proofHash = `0xBYPASS_${Date.now().toString(16)}_${Math.random().toString(16).slice(2, 10)}`;
+    try {
+      const proof = await blockchain.confirmReceipt({
+        drNumber: canonicalDr,
+        handoverContractId,
+        destination: release.lguName || '',
+        gps: bypassGps,
+        signerWallet: currentActor.wallet || undefined
+      });
+      if (proof?.hash) proofHash = proof.hash;
+    } catch (err) {
+      console.warn('Blockchain confirmReceipt for emergency bypass fallback to cryptographic record:', err);
+    }
+
+    const auditNote = `[EMERGENCY BYPASS] LGU QR scan requirement bypassed by Administrator (${currentActor.name || 'DSWD Admin'}). Reason: ${cleanReason}`;
+
+    setOutgoingReleasesList(prev => prev.map(item => item.drNumber.trim().toUpperCase() === targetDrUpper
+      ? {
+          ...item,
+          deliveryStatus: 'Accepted',
+          handoverContractId,
+          receiverSignature: proofHash,
+          receiverGps: bypassGps,
+          blockchainTxHash: proofHash,
+          auditTrail: [audit('Admin Emergency Bypass', auditNote, proofHash), ...item.auditTrail]
+        }
+      : item
+    ));
+
+    await backendApi.updateOutgoing(canonicalDr, {
+      deliveryStatus: 'Accepted',
+      receiverGps: bypassGps,
+      txHash: proofHash,
+      handoverContractId,
+      receiverSignature: proofHash,
+      walletAddress: currentActor.wallet || undefined,
+      receivedByProfileId: currentActor.id
+    }).then(() => {
+      backendApi.markTruckLiveLocationDoneByDr(canonicalDr).catch(() => {});
+    }).catch(error => {
+      logBackendError('Admin emergency bypass accept')(error);
+    });
+
+    await backendApi.logActivity({
+      action: 'ADMIN_EMERGENCY_BYPASS',
+      entityType: 'OutgoingRelease',
+      entityId: canonicalDr,
+      details: auditNote,
+      txHash: proofHash,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      metadata: {
+        drNumber: canonicalDr,
+        destination: release.lguName,
+        reason: cleanReason,
+        gps: bypassGps,
+        txHash: proofHash
+      }
+    }).catch(() => {});
+
+    return { ok: true, message: `Emergency bypass confirmed. Shipment ${canonicalDr} is now marked as Accepted.`, txHash: proofHash };
+  };
+
+  const assignEscortAndTruck = async (
+    drNumber: string,
+    truckId: string | null,
+    escortProfileId?: string | null,
+    deliveryStatus: string = 'In Transit'
+  ) => {
+    setOutgoingReleasesList(prev => prev.map(r => r.drNumber === drNumber
+      ? {
+          ...r,
+          assignedTruckId: truckId,
+          assigned_truck_id: truckId,
+          assignedEscortProfileId: escortProfileId,
+          assignedDriverProfileId: escortProfileId,
+          deliveryStatus: (deliveryStatus as OutgoingStatus) || r.deliveryStatus
+        }
+      : r));
+
+    await backendApi.assignEscortAndTruckToRelease(drNumber, truckId, escortProfileId, deliveryStatus);
+    backendApi.logActivity({
+      action: 'ESCORT_ASSIGNED',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorRole: currentActor.role,
+      details: `Assigned truck ${truckId || 'unassigned'} and relief escort officer to shipment ${drNumber}.`,
+      metadata: { drNumber, truckId, escortProfileId }
+    }).catch(() => {});
+    return { ok: true };
+  };
+
+  const emergencyCorrectLguStock = async (
+    lguId: string,
+    newStock: Record<string, number>,
+    reason: string
+  ): Promise<{ ok: boolean; message: string }> => {
+    try {
+      const targetLgu = lgusList.find(l => l.id === lguId);
+      if (!targetLgu) {
+        return { ok: false, message: 'LGU not found.' };
+      }
+
+      const canonicalNewStock: Record<string, number> = {};
+      Object.entries(newStock).forEach(([k, v]) => {
+        const canonical = normalizeCategoryName(k);
+        const val = Number(v) || 0;
+        if (canonical) canonicalNewStock[canonical] = val;
+        canonicalNewStock[k] = val;
+      });
+
+      await backendApi.emergencyCorrectLguStock(
+        lguId,
+        canonicalNewStock,
+        reason,
+        currentActor.name
+      );
+
+      backendApi.logActivity({
+        action: 'STOCK_RECOUNT',
+        entityType: 'LGU',
+        entityId: lguId,
+        details: `Emergency physical stock correction for ${targetLgu.municipality}, ${targetLgu.province}. Reason: ${reason}.`,
+        actorRole: currentActor.role,
+        metadata: {
+          lguId,
+          municipality: targetLgu.municipality,
+          province: targetLgu.province,
+          reason,
+          newStock: canonicalNewStock
+        }
+      }).catch(() => {});
+
+      // Update in-memory lgusList state immediately
+      setLgusList(prev => prev.map(lgu => {
+        if (lgu.id !== lguId && lgu.municipality.toLowerCase() !== targetLgu.municipality.toLowerCase()) return lgu;
+        return {
+          ...lgu,
+          foodPacks: canonicalNewStock['Family Food Pack'] !== undefined ? canonicalNewStock['Family Food Pack'] : (canonicalNewStock['Food Pack'] !== undefined ? canonicalNewStock['Food Pack'] : lgu.foodPacks),
+          hygieneKits: canonicalNewStock['Hygiene Kit'] !== undefined ? canonicalNewStock['Hygiene Kit'] : lgu.hygieneKits,
+          familyKits: canonicalNewStock['Family Kit'] !== undefined ? canonicalNewStock['Family Kit'] : lgu.familyKits,
+          sleepingKits: canonicalNewStock['Sleeping Kit'] !== undefined ? canonicalNewStock['Sleeping Kit'] : lgu.sleepingKits,
+          kitchenKits: canonicalNewStock['Kitchen Kit'] !== undefined ? canonicalNewStock['Kitchen Kit'] : lgu.kitchenKits,
+          laminatedSacks: canonicalNewStock['Laminated Sacks'] !== undefined ? canonicalNewStock['Laminated Sacks'] : (canonicalNewStock['Laminated Sack'] !== undefined ? canonicalNewStock['Laminated Sack'] : lgu.laminatedSacks),
+          rtef: canonicalNewStock['Ready-to-Eat Food (RTEF)'] !== undefined ? canonicalNewStock['Ready-to-Eat Food (RTEF)'] : (canonicalNewStock['RTEF'] !== undefined ? canonicalNewStock['RTEF'] : lgu.rtef),
+          currentStock: {
+            ...(lgu.currentStock || {}),
+            ...canonicalNewStock
+          }
+        };
+      }));
+
+      // Update in-memory lguPriorityReports state immediately
+      setLguPriorityReports(prev => prev.map(rep => {
+        if (rep.id !== lguId && rep.municipality.toLowerCase() !== targetLgu.municipality.toLowerCase()) return rep;
+        const updatedFood = canonicalNewStock['Family Food Pack'] !== undefined ? canonicalNewStock['Family Food Pack'] : (canonicalNewStock['Food Pack'] !== undefined ? canonicalNewStock['Food Pack'] : rep.foodPacks);
+        const maxStock = Number(rep.maxStock) > 0 ? Number(rep.maxStock) : (Number(targetLgu.maxStock) > 0 ? Number(targetLgu.maxStock) : 3000);
+        const evalRes = evaluatePriorityIndicator({
+          foodPacks: updatedFood,
+          affectedFamilies: rep.affectedFamilies,
+          targetQuota: maxStock
+        });
+        return {
+          ...rep,
+          foodPacks: updatedFood,
+          hygieneKits: canonicalNewStock['Hygiene Kit'] !== undefined ? canonicalNewStock['Hygiene Kit'] : rep.hygieneKits,
+          familyKits: canonicalNewStock['Family Kit'] !== undefined ? canonicalNewStock['Family Kit'] : rep.familyKits,
+          maxStock,
+          urgencyScore: evalRes.urgencyScore,
+          priorityColor: evalRes.priorityColor,
+          priorityLevel: evalRes.priorityLevel,
+          stockRate: evalRes.stockRate,
+          completionRate: evalRes.completionRate,
+          effectiveRate: evalRes.effectiveRate,
+          systemResponse: evalRes.systemResponse
+        };
+      }));
+
+      // Refresh full DB record in background to ensure all calculated fields are in sync
+      void refreshLgus();
+
+      return {
+        ok: true,
+        message: `Emergency stock correction successfully applied for ${targetLgu.municipality}, ${targetLgu.province}.`
+      };
+    } catch (err: any) {
+      console.error('Emergency stock correction failed:', err);
+      return {
+        ok: false,
+        message: err?.message || 'Failed to update LGU stock in database.'
+      };
+    }
+  };
+
+  const submitLGUInventoryReport = async (input: LGUInventoryReportInput) => {
+    try {
+      await blockchain.requireConnectedWalletRole('LGUReceiver');
+    } catch (error) {
+      return { ok: false, message: toFriendlyTxError(error, 'LGUReceiver privileges required to submit this report.') };
+    }
+
+    const computed = computePriority(input);
+    const optimistic: LGUPriorityReport = {
+      ...input,
+      id: `LGU-RPT-${Date.now()}`,
+      reportedAt: nowStamp(),
+      ...computed
+    };
+
+    setLguPriorityReports(prev => deduplicateLguPriorityReports([optimistic, ...prev]));
+
+    try {
+      await backendApi.createLGUInventoryReport({
+        ...input,
+        ...computed,
+        lguId: input.lguId || (currentActor as any).lguId,
+        reportedByProfileId: currentActor.id
+      });
+      setIntegrationMode('backend');
+
+      backendApi.logActivity({
+        action: 'LGU_REPORT_SUBMITTED',
+        entityType: 'LGUReport',
+        entityId: input.lguId || input.municipality,
+        actorId: currentActor.id,
+        actorName: currentActor.name,
+        actorEmail: currentActor.email,
+        actorRole: 'LGUReceiver',
+        actorWallet: currentActor.wallet,
+        details: `Submitted LGU inventory report for ${input.municipality}, ${input.province}: ${input.foodPacks} food packs, ${input.affectedFamilies || 0} affected families. Priority: ${computed.priorityLevel} (${computed.priorityColor}).`,
+        metadata: {
+          municipality: input.municipality,
+          province: input.province,
+          foodPacks: input.foodPacks,
+          hygieneKits: input.hygieneKits,
+          familyKits: input.familyKits,
+          affectedFamilies: input.affectedFamilies,
+          damageIndex: input.damageIndex,
+          priorityLevel: computed.priorityLevel,
+          priorityColor: computed.priorityColor,
+          urgencyScore: computed.urgencyScore
+        }
+      }).catch(() => {});
+
+      return { ok: true, message: 'LGU inventory report submitted to Supabase and priority score recalculated.' };
+    } catch (error) {
+      logBackendError('Create LGU inventory report')(error);
+      setIntegrationMode('mock');
+      return { ok: false, message: 'Report is visible locally, but Supabase persistence failed. Check lgu_inventory_reports schema/RLS.' };
+    }
   };
 
   useEffect(() => {
-    const loadDashboard = () => backendApi.getDashboard()
-      .then(({ incoming, outgoing }) => {
-        setIncomingGoodsList(incoming.map(mapIncomingManifest));
-        setOutgoingReleasesList(outgoing.map(mapOutgoingRequest));
+    if (!enabled) return undefined;
+
+    let isMasterDataLoaded = false;
+    let isFetching = false;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const loadMasterDataOnce = async () => {
+      if (isMasterDataLoaded) return;
+      try {
+        const [lgus, provinces, warehouses, sources, kits, trucks, incidents] = await Promise.all([
+          backendApi.getLgus(),
+          backendApi.getProvinces(),
+          backendApi.getWarehouses(),
+          backendApi.getSupplySources(),
+          backendApi.getKitTypes(),
+          backendApi.getTrucks(),
+          backendApi.getIncidents()
+        ]);
+        const resolvedLgus = (lgus && lgus.length > 0) ? lgus : DEFAULT_PANAY_LGUS;
+        setLgusList(resolvedLgus);
+        if (provinces && provinces.length > 0) setProvincesList(provinces);
+        if (warehouses && warehouses.length > 0) setWarehousesList(warehouses);
+        if (sources && sources.length > 0) setSupplySourcesList(sources);
+        if (kits && kits.length > 0) setKitTypesList(kits);
+        if (trucks && trucks.length > 0) setTrucksList(trucks);
+        if (incidents && incidents.length > 0) setIncidentsList(incidents);
+
+        const reportsFromLgus: LGUPriorityReport[] = resolvedLgus.map(l => {
+          const maxStock = Number(l.maxStock) > 0 ? Number(l.maxStock) : 3000;
+          const evalRes = evaluatePriorityIndicator({
+            foodPacks: l.foodPacks,
+            affectedFamilies: l.affectedFamilies,
+            targetQuota: maxStock
+          });
+          const hasEmergency = Number(l.affectedFamilies ?? 0) > 0 || Number(l.damageIndex ?? 0) > 0;
+          const priorityColor: PriorityColor = hasEmergency
+            ? evalRes.priorityColor
+            : (l.priorityColor as PriorityColor)
+              || (evalRes.effectiveRate >= 75 ? 'Green' : evalRes.effectiveRate >= 50 ? 'Yellow' : evalRes.effectiveRate >= 25 ? 'Orange' : 'Green');
+          const priorityLevel: PriorityLevel = priorityColor === 'Red' ? 'Severe'
+            : priorityColor === 'Orange' ? 'Low'
+            : priorityColor === 'Yellow' ? 'Medium'
+            : 'Adequate';
+          const urgencyScore = priorityColor === 'Red' ? Math.max(75, evalRes.urgencyScore)
+            : priorityColor === 'Orange' ? Math.min(74, Math.max(50, evalRes.urgencyScore))
+            : priorityColor === 'Yellow' ? Math.min(49, Math.max(25, evalRes.urgencyScore))
+            : Math.min(24, Math.max(5, evalRes.urgencyScore));
+
+          return {
+            id: l.id,
+            lguId: l.id,
+            municipality: l.municipality,
+            province: l.province,
+            lguName: l.lguName || `${l.municipality} Municipal Office`,
+            foodPacks: l.foodPacks,
+            hygieneKits: l.hygieneKits,
+            familyKits: l.familyKits,
+            affectedFamilies: l.affectedFamilies,
+            damageIndex: l.damageIndex,
+            maxStock,
+            urgencyScore,
+            priorityColor,
+            priorityLevel,
+            stockRate: evalRes.stockRate,
+            completionRate: evalRes.completionRate,
+            effectiveRate: evalRes.effectiveRate,
+            systemResponse: evalRes.systemResponse,
+            recommendation: l.recommendation || evalRes.systemResponse,
+            reportedAt: l.lastReportedAt || l.updatedAt || new Date().toISOString()
+          };
+        });
+        setLguPriorityReports(reportsFromLgus);
+        isMasterDataLoaded = true;
+      } catch (err) {
+        console.warn('Failed to load master tables:', err);
+      }
+    };
+
+    const loadLiveInventory = async () => {
+      if (isFetching) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+
+      isFetching = true;
+      try {
+        const { incoming, outgoing, discrepancyReports: discrepancyRows, trucks, incidents, warehouseStock, lguStock, batches } = await backendApi.getDashboard();
+        const discList = (discrepancyRows ?? []).map(mapDiscrepancyReport);
+        setDiscrepancyReports(discList);
+        if (trucks && trucks.length > 0) setTrucksList(trucks);
+        if (incidents && incidents.length > 0) setIncidentsList(incidents);
+        if (warehouseStock) setWarehouseStockList(warehouseStock);
+        if (lguStock) setLguStockList(lguStock);
+        if (batches) setInventoryBatchesList(batches);
+        setIncomingGoodsList(incoming.map(row => {
+          const mapped = mapIncomingManifest(row);
+          if (!mapped.correctionNote && mapped.status === 'Correction Requested') {
+            const matchedDisc = discList.find(d => d.reportType === 'Incoming' && (d.manifestNumber === mapped.id || d.manifestNumber === row.manifest_number));
+            if (matchedDisc) mapped.correctionNote = matchedDisc.note;
+          }
+          return mapped;
+        }));
+        setOutgoingReleasesList(outgoing.map(row => {
+          const mapped = mapOutgoingRequest(row);
+          if (!mapped.correctionNote && mapped.deliveryStatus === 'Correction Requested') {
+            const matchedDisc = discList.find(d => d.reportType === 'Outgoing' && (d.drNumber === mapped.drNumber || d.drNumber === row.dr_number));
+            if (matchedDisc) mapped.correctionNote = matchedDisc.note;
+          }
+          return mapped;
+        }));
         setIntegrationMode('backend');
-      })
-      .catch(() => setIntegrationMode('mock'));
+      } catch {
+        setIntegrationMode('mock');
+      } finally {
+        isFetching = false;
+      }
+    };
 
-    loadDashboard();
-    const unsubscribe = backendApi.subscribeDashboard(loadDashboard);
+    const debouncedRefresh = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        void loadLiveInventory();
+      }, 600);
+    };
 
-    return unsubscribe;
-  }, []);
+    void loadMasterDataOnce();
+    void loadLiveInventory();
+
+    const unsubscribe = backendApi.subscribeDashboard(debouncedRefresh);
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        void loadLiveInventory();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    const pollTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        void loadLiveInventory();
+      }
+    }, 45000);
+
+    return () => {
+      unsubscribe();
+      clearInterval(pollTimer);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [enabled]);
+
+  const refreshLgus = async () => {
+    try {
+      const list = await backendApi.getLgus();
+      setLgusList(list);
+      const reportsFromLgus: LGUPriorityReport[] = list.map(l => {
+        const maxStock = Number(l.maxStock) > 0 ? Number(l.maxStock) : 3000;
+        const evalRes = evaluatePriorityIndicator({
+          foodPacks: l.foodPacks,
+          affectedFamilies: l.affectedFamilies,
+          targetQuota: maxStock
+        });
+        const hasEmergency = Number(l.affectedFamilies ?? 0) > 0 || Number(l.damageIndex ?? 0) > 0;
+        const priorityColor: PriorityColor = hasEmergency
+          ? evalRes.priorityColor
+          : (l.priorityColor as PriorityColor)
+            || (evalRes.effectiveRate >= 75 ? 'Green' : evalRes.effectiveRate >= 50 ? 'Yellow' : evalRes.effectiveRate >= 25 ? 'Orange' : 'Green');
+        const priorityLevel: PriorityLevel = priorityColor === 'Red' ? 'Severe'
+          : priorityColor === 'Orange' ? 'Low'
+          : priorityColor === 'Yellow' ? 'Medium'
+          : 'Adequate';
+        const urgencyScore = priorityColor === 'Red' ? Math.max(75, evalRes.urgencyScore)
+          : priorityColor === 'Orange' ? Math.min(74, Math.max(50, evalRes.urgencyScore))
+          : priorityColor === 'Yellow' ? Math.min(49, Math.max(25, evalRes.urgencyScore))
+          : Math.min(24, Math.max(5, evalRes.urgencyScore));
+
+        return {
+          id: l.id,
+          lguId: l.id,
+          municipality: l.municipality,
+          province: l.province,
+          lguName: l.lguName || `${l.municipality} Municipal Office`,
+          foodPacks: l.foodPacks,
+          hygieneKits: l.hygieneKits,
+          familyKits: l.familyKits,
+          affectedFamilies: l.affectedFamilies,
+          damageIndex: l.damageIndex,
+          maxStock,
+          urgencyScore,
+          priorityColor,
+          priorityLevel,
+          stockRate: evalRes.stockRate,
+          completionRate: evalRes.completionRate,
+          effectiveRate: evalRes.effectiveRate,
+          systemResponse: evalRes.systemResponse,
+          recommendation: l.recommendation || evalRes.systemResponse,
+          reportedAt: l.lastReportedAt || l.updatedAt || new Date().toISOString()
+        };
+      });
+      setLguPriorityReports(reportsFromLgus);
+    } catch (err) {
+      console.warn('Failed to refresh lgus:', err);
+    }
+  };
 
   const requestOutgoingCorrection = (drNumber: string, note: string) => {
+    const newReport: DiscrepancyReport = {
+      id: `DISC-${Date.now()}`,
+      reportType: 'Outgoing',
+      drNumber,
+      note,
+      reportedAt: nowStamp()
+    };
+    setDiscrepancyReports(prev => [newReport, ...prev]);
+
     setOutgoingReleasesList(prev => prev.map(item => item.drNumber === drNumber
       ? { ...item, deliveryStatus: 'Correction Requested', correctionNote: note, auditTrail: [makeAudit('Correction Requested', note), ...item.auditTrail] }
       : item));
+    backendApi.updateOutgoing(drNumber, { deliveryStatus: 'Correction Requested' }).catch(error => {
+      logBackendError('Request outgoing correction')(error);
+      setIntegrationMode('mock');
+    });
+    backendApi.createDiscrepancyReport({
+      reportType: 'Outgoing',
+      drNumber,
+      note,
+      reportedByProfileId: currentActor.id,
+      reportedByRole: currentActor.role,
+      reportedByWallet: currentActor.wallet
+    }).catch(error => {
+      logBackendError('Create outgoing discrepancy report')(error);
+      setIntegrationMode('mock');
+    });
+
+    backendApi.logActivity({
+      action: 'CORRECTION_REQUESTED',
+      entityType: 'OutgoingRelease',
+      entityId: drNumber,
+      actorId: currentActor.id,
+      actorName: currentActor.name,
+      actorEmail: currentActor.email,
+      actorRole: currentActor.role,
+      actorWallet: currentActor.wallet,
+      details: `Discrepancy reported and correction requested for delivery release ${drNumber}: ${note}`,
+      metadata: { drNumber, note, reportType: 'Outgoing' }
+    }).catch(() => {});
   };
+
+  const synchronizedLgusList = useMemo<SynchronizedLgu[]>(() => {
+    return computeSynchronizedLgus({
+      masterLgus: lgusList,
+      outgoingReleases: outgoingReleasesList,
+      incomingGoods: incomingGoodsList,
+      lguPriorityReports: lguPriorityReports
+    });
+  }, [lgusList, outgoingReleasesList, incomingGoodsList, lguPriorityReports]);
 
   return {
     inventory,
     incomingGoodsList,
     outgoingReleasesList,
     lguPriorityReports,
+    discrepancyReports,
+    lgusList: synchronizedLgusList,
+    synchronizedLgusList,
+    trucksList,
+    incidentsList,
+    warehouseStockList,
+    lguStockList,
+    inventoryBatchesList,
+    addLgu,
+    editLgu,
+    provincesList,
+    warehousesList,
+    supplySourcesList,
+    kitTypesList,
+    refreshLgus,
+    refreshProvinces,
+    refreshWarehouses,
+    refreshSupplySources,
+    refreshKitTypes,
+    refreshTrucks,
+    refreshIncidents,
+    refreshInventoryBatches,
     addStock,
+    addLguStock,
+    deductLguStock,
+    emergencyCorrectLguStock,
     deductStock,
     getAvailableStock,
     addIncomingGoods,
+    replenishLguTransfer,
     updateIncomingGoods,
     submitIncomingForVerification,
     verifyIncomingReceipt,
+    cancelIncomingGoods,
     mintBatchToken,
     requestIncomingCorrection,
     addOutgoingRelease,
     updateOutgoingRelease,
     approveAllocation,
+    cancelOutgoingRelease,
     senderSignAndRelease,
     markInTransit,
     receiverAcceptWithGps,
-    requestOutgoingCorrection
-    ,
-    integrationMode
+    adminEmergencyBypassAccept,
+    assignEscortAndTruck,
+    recordCustodyHop: backendApi.recordCustodyHop.bind(backendApi),
+    getCustodyHops: backendApi.getCustodyHops.bind(backendApi),
+    getEscortProfiles: backendApi.getEscortProfiles.bind(backendApi),
+    requestOutgoingCorrection,
+    submitLGUInventoryReport,
+    integrationMode,
+    adminActionsEnabled,
+    setAdminActionsEnabled
   };
 }

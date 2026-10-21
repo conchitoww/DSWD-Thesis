@@ -17,6 +17,8 @@ function figmaAssetResolver() {
 }
 
 export default defineConfig({
+  base: './',
+  envPrefix: ['VITE_', 'NEXT_PUBLIC_'],
   plugins: [
     figmaAssetResolver(),
     // The React and Tailwind plugins are both required for Make, even if
@@ -24,11 +26,21 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  define: {
+    global: 'globalThis',
+  },
   resolve: {
     alias: {
       // Alias @ to the src directory
       '@': path.resolve(__dirname, './src'),
     },
+  },
+  server: {
+    allowedHosts: [
+      'stays-hardwood-saga.ngrok-free.dev',
+      '.ngrok-free.dev',
+      '.ngrok-free.app'
+    ],
   },
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.

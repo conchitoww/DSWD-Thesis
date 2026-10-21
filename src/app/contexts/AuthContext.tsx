@@ -1,0 +1,133 @@
+import { createContext, ReactNode, useContext, useEffect, useMemo, useState } from 'react';
+import type { Session } from '@supabase/supabase-js';
+import { supabase } from '../lib/supabase';
+import { authApi, UserProfile } from '../services/authApi';
+
+interface AuthContextValue {
+  session: Session | null;
+  profile: UserProfile | null;
+  isLoading: boolean;
+  isLoggingOut: boolean;
+  refreshProfile: () => Promise<void>;
+  signOut: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<Session | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+
+  const loadProfile = async (nextSession: Session | null) => {
+    if (!nextSession?.user) {
+      setProfile(null);
+      return;
+    }
+
+    const nextProfile = await authApi.getProfile(nextSession.user.id, nextSession.user.email);
+    setProfile(nextProfile);
+  };
+
+  const refreshProfile = async () => {
+    const { data } = await supabase.auth.getSession();
+    setSession(data.session);
+    await loadProfile(data.session);
+  };
+
+  // Real-time listener for current user's profile changes (e.g. admin verification approval)
+  useEffect(() => {
+    const currentUserId = session?.user?.id;
+    if (!currentUserId) return;
+
+    const channel = supabase
+      .channel(`user-profile-sync-${currentUserId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'profiles',
+          filter: `id=eq.${currentUserId}`
+        },
+        () => {
+          loadProfile(session).catch((err) => {
+            console.error('Failed to sync profile after update:', err);
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [session?.user?.id]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    supabase.auth.getSession()
+      .then(async ({ data }) => {
+        if (!isMounted) return;
+        setSession(data.session);
+        await loadProfile(data.session);
+      })
+      .catch((error) => {
+        console.error('Failed to restore auth session', error);
+      })
+      .finally(() => {
+        if (isMounted) setIsLoading(false);
+      });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      if (nextSession?.user) {
+        loadProfile(nextSession).catch((error) => {
+          console.error('Failed to load profile after auth change', error);
+        });
+      } else {
+        setProfile(null);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  const handleSignOut = async () => {
+    setIsLoggingOut(true);
+    setSession(null);
+    setProfile(null);
+    try {
+      await authApi.signOut();
+    } catch (err) {
+      console.error('Failed to sign out', err);
+    } finally {
+      setIsLoggingOut(false);
+    }
+  };
+
+  const value = useMemo<AuthContextValue>(() => ({
+    session,
+    profile,
+    isLoading,
+    isLoggingOut,
+    refreshProfile,
+    signOut: handleSignOut
+  }), [session, profile, isLoading, isLoggingOut]);
+
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error('useAuth must be used inside AuthProvider.');
+  return context;
+};
